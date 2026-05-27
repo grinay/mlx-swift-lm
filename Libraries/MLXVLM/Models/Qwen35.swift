@@ -9,6 +9,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -23,6 +24,189 @@ private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXAr
 {
     let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
     return decay.asType(a.dtype)
+}
+
+// MARK: - Gated Delta Metal Kernel (prefill fast path)
+//
+// Verbatim port of `mlx_lm.models.gated_delta._make_gated_delta_kernel`. The
+// kernel runs the entire T-step recurrence inside ONE Metal dispatch. Swift's
+// previous `gatedDeltaOps` looped t = 0..<T in Swift, paying ~10 Swift→C
+// MLX-op dispatches per token × T tokens × 18 GatedDeltaNet layers ≈ ~200k
+// roundtrips per prefill. With this kernel a 1087-token Qwen3.5-VL prefill
+// drops from ~200k dispatches to ~18 (one per layer).
+//
+// Four variants are pre-compiled to cover { vectorized g, has mask } cross-
+// product (matches Python). Compilation is lazy + memoized at module level.
+
+private struct GatedDeltaKernelCache {
+    let plain: MLXFast.MLXFastKernel
+    let masked: MLXFast.MLXFastKernel
+    let vec: MLXFast.MLXFastKernel
+    let vecMasked: MLXFast.MLXFastKernel
+}
+
+private let _gatedDeltaKernels: GatedDeltaKernelCache = {
+    func source(hasMask: Bool, vectorized: Bool) -> String {
+        let maskSrc = hasMask ? "mask[b_idx * T + t]" : "true"
+        let gComment: String
+        let gSetup: String
+        let gAccess: String
+        let gAdvance: String
+        if vectorized {
+            gComment = "// g: [B, T, Hv, Dk]"
+            gSetup = "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
+            gAccess = "g_[s_idx]"
+            gAdvance = "g_ += Hv * Dk;"
+        } else {
+            gComment = "// g: [B, T, Hv]"
+            gSetup = "auto g_ = g + b_idx * T * Hv;"
+            gAccess = "g_[hv_idx]"
+            gAdvance = "g_ += Hv;"
+        }
+        // Note: this is Metal C++. Some braces are doubled in Python's f-string
+        // for escaping; here we write them once.
+        return """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+
+            // q, k: [B, T, Hk, Dk]
+            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+            // v, y: [B, T, Hv, Dv]
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            // state_in, state_out: [B, Hv, Dv, Dk]
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+            float state[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = static_cast<float>(i_state[s_idx]);
+            }
+
+            \(gComment)
+            \(gSetup)
+            auto beta_ = beta + b_idx * T * Hv;
+
+            for (int t = 0; t < T; ++t) {
+              if (\(maskSrc)) {
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[i] = state[i] * \(gAccess);
+                  kv_mem += state[i] * k_[s_idx];
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[i] = state[i] + k_[s_idx] * delta;
+                  out += state[i] * q_[s_idx];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                  y[dv_idx] = static_cast<InT>(out);
+                }
+              } else {
+                y[dv_idx] = static_cast<InT>(0);
+              }
+              // Increment data pointers to next time step
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              \(gAdvance)
+              beta_ += Hv;
+            }
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[s_idx] = static_cast<StT>(state[i]);
+            }
+            """
+    }
+    func make(hasMask: Bool, vectorized: Bool) -> MLXFast.MLXFastKernel {
+        var inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
+        if hasMask { inputs.append("mask") }
+        var suffix = ""
+        if vectorized { suffix += "_vec" }
+        if hasMask { suffix += "_mask" }
+        return MLXFast.metalKernel(
+            name: "gated_delta_step\(suffix)",
+            inputNames: inputs,
+            outputNames: ["y", "state_out"],
+            source: source(hasMask: hasMask, vectorized: vectorized)
+        )
+    }
+    return GatedDeltaKernelCache(
+        plain: make(hasMask: false, vectorized: false),
+        masked: make(hasMask: true, vectorized: false),
+        vec: make(hasMask: false, vectorized: true),
+        vecMasked: make(hasMask: true, vectorized: true)
+    )
+}()
+
+/// Whole-sequence gated-delta scan via a single Metal kernel.
+/// Mirrors `mlx_lm.models.gated_delta.gated_delta_kernel`. Inputs are passed
+/// in the model-native layout — no pre-repeat of q/k for GQA, the kernel
+/// handles the head mapping (`hk_idx = hv_idx / (Hv/Hk)`).
+private func gatedDeltaKernelOps(
+    q: MLXArray, k: MLXArray, v: MLXArray,
+    g: MLXArray, beta: MLXArray, state: MLXArray,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let B = k.dim(0)
+    let T = k.dim(1)
+    let Hk = k.dim(2)
+    let Dk = k.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+
+    let kernel: MLXFast.MLXFastKernel
+    var inputs: [any ScalarOrArray] = [q, k, v, g, beta, state, T]
+    if g.ndim == 4 {
+        if let mask {
+            kernel = _gatedDeltaKernels.vecMasked
+            inputs.append(mask)
+        } else {
+            kernel = _gatedDeltaKernels.vec
+        }
+    } else {
+        if let mask {
+            kernel = _gatedDeltaKernels.masked
+            inputs.append(mask)
+        } else {
+            kernel = _gatedDeltaKernels.plain
+        }
+    }
+
+    let outputs = kernel(
+        inputs,
+        template: [
+            ("InT", q.dtype),
+            ("StT", state.dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid: (32, Dv, B * Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[B, T, Hv, Dv], state.shape],
+        outputDTypes: [q.dtype, state.dtype]
+    )
+    return (outputs[0], outputs[1])
 }
 
 private func gatedDeltaStepOps(
@@ -83,6 +267,27 @@ private func gatedDeltaOps(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
 
+    let initialState = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+
+    // Prefill fast path: when processing multiple tokens at once, dispatch to
+    // a single Metal kernel that runs the whole T-step recurrence in one
+    // GPU launch. Mirrors `mlx_lm.models.gated_delta.gated_delta_kernel`.
+    // The Swift loop below was the dominant prefill bottleneck — for a
+    // 1087-token prompt × 18 GatedDeltaNet layers it dispatched ~200k MLX
+    // ops via Swift→C boundary. The kernel reduces that to one dispatch
+    // per layer (~18 total).
+    //
+    // Decode (T==1) keeps the existing per-step path. The kernel still works
+    // for T==1 but the loop wins on dispatch cost when there's only one step.
+    // The kernel also needs Dk to be a multiple of 32 (it uses simd_sum
+    // across 32-thread simd groups); the per-step path is the fallback.
+    if T > 1 && Dk % 32 == 0 {
+        return gatedDeltaKernelOps(
+            q: q, k: k, v: v, g: g, beta: beta,
+            state: initialState, mask: mask
+        )
+    }
+
     var q = q
     var k = k
 
@@ -92,8 +297,7 @@ private func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
-
+    var state = initialState
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
 
@@ -1053,18 +1257,20 @@ public class Qwen35: Module, VLMModel {
         let videoMask = (inputIds .== MLXArray(videoTokenIndex))
         var specialMask = imageMask .|| videoMask
 
-        let nImageTokens = specialMask.sum().item(Int.self)
+        // perf/prefill-fixes: the previous `.item(Int.self)` calls on
+        // specialMask.sum() and maskExpanded.sum() forced GPU→CPU syncs
+        // purely to count tokens for an error message + sanity check.
+        // Each one stalled the prefill pipeline (vision-encoder work in
+        // flight has to drain before we can read 1 element back to CPU),
+        // and the count from .item() blocked the subsequent nonZero CPU
+        // loop from overlapping with downstream GPU work. We trust the
+        // processor to produce matching shapes (the Python mlx-vlm
+        // implementation makes the same assumption). If they really
+        // mismatch, the indexed assignment below will throw with an
+        // index-out-of-bounds error that's just as actionable.
 
         specialMask = expandedDimensions(specialMask, axis: -1)
         let maskExpanded = broadcast(specialMask, to: inputEmbeds.shape)
-
-        let nImageFeatures = imageFeatures.dim(0)
-        let nImageMaskElements = maskExpanded.sum().item(Int.self)
-        let imageFeatureSize = imageFeatures.size
-
-        guard nImageMaskElements == imageFeatureSize else {
-            throw Qwen35VLError.featureTokenMismatch(expected: nImageTokens, actual: nImageFeatures)
-        }
 
         let originalShape = inputEmbeds.shape
         let flattenedEmbeds = inputEmbeds.flattened()

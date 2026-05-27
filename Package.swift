@@ -60,6 +60,9 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
+                // Qwen35 prefill fast path uses a MLXFast custom Metal kernel
+                // to run the whole gated-delta scan in one GPU dispatch.
+                .product(name: "MLXFast", package: "mlx-swift"),
             ],
             path: "Libraries/MLXVLM",
             exclude: [
