@@ -297,6 +297,27 @@ private func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
+    // Decode fast path (T==1, every generated token). The hot loop below uses
+    // `q[0..., t]` etc., which routes through MLXArray.subscript →
+    // getItemND → expandEllipsisOperations → Array<MLXArrayIndexOperation>
+    // construction + repeated `asInt32` shape conversions. For T==1 we know
+    // every operand has shape [B, 1, H, D]: a single `squeezed(axis: 1)`
+    // call dispatches one C-API squeeze instead of the entire indexing
+    // pipeline. In the gen-only profile this was 25/31 samples inside
+    // gatedDeltaOps (and gatedDeltaOps is invoked 18 layers × every token).
+    if T == 1 {
+        let (y, newState) = gatedDeltaStepOps(
+            q: q.squeezed(axis: 1),
+            k: k.squeezed(axis: 1),
+            v: v.squeezed(axis: 1),
+            g: g.squeezed(axis: 1),
+            beta: beta.squeezed(axis: 1),
+            state: initialState,
+            mask: mask?.squeezed(axis: 1)
+        )
+        return (y.expandedDimensions(axis: 1), newState)
+    }
+
     var state = initialState
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
