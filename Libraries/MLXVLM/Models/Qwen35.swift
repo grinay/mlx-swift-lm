@@ -1277,27 +1277,29 @@ public class Qwen35: Module, VLMModel {
         let flattenedFeatures = imageFeatures.flattened()
         let flattenedMask = maskExpanded.flattened()
 
-        let indices = nonZero(flattenedMask.asType(.bool))
+        // perf/prefill-fixes: pure-GPU masked scatter. The previous nonZero()
+        // CPU loop materialized a ~2.2M-element bool mask to Swift, iterated
+        // to collect indices, then wrapped them back as an MLXArray. Two
+        // CPU↔GPU round trips per prefill, ~230 samples in a profile.
+        //
+        // The cumsum trick (lifted from `masked_scatter` in mlx_vlm's gemma4/
+        // gemma3n) stays entirely on the GPU:
+        //   1. Convert mask to int → cumsum-1 gives, for each position, the
+        //      index into `features` if that position is True (and a stale
+        //      index when False — we discard those via where).
+        //   2. `% featuresSize` keeps the gather indices in bounds even on
+        //      False positions (so `take` doesn't read out of bounds).
+        //   3. `where(mask, aligned, embeds)` selects the right tensor at
+        //      each position.
+        let maskInt = flattenedMask.asType(.int32)
+        let positionIndex = (cumsum(maskInt) - MLXArray(Int32(1))).asType(.int32)
+        let featuresSize = MLXArray(Int32(flattenedFeatures.size))
+        let aligned = MLX.take(flattenedFeatures, positionIndex % featuresSize, axis: 0)
+        let resultFlat = MLX.where(flattenedMask, aligned, flattenedEmbeds)
 
-        var result = flattenedEmbeds
-        if !indices.isEmpty && indices.count == flattenedFeatures.size {
-            let indexArray = MLXArray(indices.map { UInt32($0) })
-            result[indexArray] = flattenedFeatures
-        }
-
-        result = result.reshaped(originalShape)
+        let result = resultFlat.reshaped(originalShape)
         let visualMask = specialMask.squeezed(axis: -1).asType(.bool)
         return (result, visualMask)
-    }
-
-    private func nonZero(_ mask: MLXArray) -> [Int] {
-        let values = mask.asArray(Bool.self)
-        var indices: [Int] = []
-        indices.reserveCapacity(values.count)
-        for (idx, value) in values.enumerated() where value {
-            indices.append(idx)
-        }
-        return indices
     }
 
     private func combinedFrames(imageFrames: [THW]?, videoFrames: [THW]?) -> [THW] {
