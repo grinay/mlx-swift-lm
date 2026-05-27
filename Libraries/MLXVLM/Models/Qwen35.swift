@@ -551,35 +551,49 @@ enum Qwen35Language {
     final class RotaryEmbedding {
         private let invFreq: MLXArray
         private let mropeSection: [Int]
+        // perf/prefill-fixes: precomputed per-dim selector for applyInterleaved
+        // MRope. The selection of which of freqs[{0,1,2}] to take at each rotary
+        // dim is fully determined by mropeSection — computed once here instead
+        // of dispatching ~dims MLX subscripts inside every attention call.
+        private let mropeSelector: MLXArray
 
         init(dim: Int, base: Float, mropeSection: [Int]) {
             let safeDim = max(1, dim)
             var freq = MLXArray(stride(from: 0, to: safeDim, by: 2)).asType(.float32)
             freq = freq / Float(safeDim)
             self.invFreq = 1.0 / pow(MLXArray(base), freq)
-            self.mropeSection =
-                mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
+            let mrope = mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
+            self.mropeSection = mrope
+
+            // Build selector[idx] ∈ {0,1,2} per rotary dim. dim 1 / dim 2 take
+            // priority over dim 0 (default); they cover disjoint idx sets because
+            // (idx-1) % 3 == 0 and (idx-2) % 3 == 0 never coincide, so order
+            // doesn't matter — match the original "break"-style logic exactly.
+            let dims = freq.dim(0)
+            var selector = [Int32](repeating: 0, count: dims)
+            for (sourceDim, offset) in [(1, 1), (2, 2)] {
+                let length = min(mrope[sourceDim] * 3, dims)
+                var idx = offset
+                while idx < length {
+                    selector[idx] = Int32(sourceDim)
+                    idx += 3
+                }
+            }
+            self.mropeSelector = MLXArray(selector).reshaped([1, 1, 1, dims])
         }
 
         private func applyInterleavedMRope(_ freqs: MLXArray) -> MLXArray {
-            let freqsT = freqs[0, 0..., 0..., 0...]
-            let dims = freqsT.dim(-1)
-            var slices: [MLXArray] = []
-            slices.reserveCapacity(dims)
-
-            for idx in 0 ..< dims {
-                var slice = freqsT[0..., 0..., idx]
-                for (dim, offset) in [(1, 1), (2, 2)] {
-                    let length = min(mropeSection[dim] * 3, dims)
-                    if idx >= offset && idx < length && ((idx - offset) % 3 == 0) {
-                        slice = freqs[dim, 0..., 0..., idx]
-                        break
-                    }
-                }
-                slices.append(slice)
-            }
-
-            return stacked(slices, axis: -1)
+            // freqs shape: [3, B, T, dims]. Pick freqs[selector[d], b, t, d] at
+            // each rotary dim d in ONE GPU op via take_along_axis, replacing
+            // the original `dims`-iteration Swift loop + per-iteration MLX
+            // subscripts (was ~263 samples per profile, the bulk of attention).
+            let B = freqs.dim(1)
+            let T = freqs.dim(2)
+            let dims = freqs.dim(3)
+            let selector = broadcast(mropeSelector, to: [1, B, T, dims])
+            let gathered = takeAlong(freqs, selector, axis: 0)
+            // gathered shape: [1, B, T, dims] — squeeze the source-dim axis.
+            return gathered.squeezed(axis: 0)
         }
 
         func callAsFunction(x: MLXArray, positionIds: MLXArray) -> (MLXArray, MLXArray) {
