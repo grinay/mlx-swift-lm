@@ -333,20 +333,27 @@ struct TokenRing {
     }
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
+    ///
+    /// Accepts both `[T]` (text LM) and `[B=1, T]` (VLM after
+    /// `expandedDimensions(axis: 0)`) shapes. The original implementation
+    /// read `prompt.dim(0)` as the token count, which for a 2-D VLM prompt
+    /// is the batch dim (1) not the sequence dim — buffer ended up sized to
+    /// the full token count instead of `capacity`, blowing up the next
+    /// `append` with a broadcast-shape mismatch.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let n = prompt.dim(0)
-        let promptTokens = prompt.asType(.int32)
+        let flat = prompt.reshaped(-1).asType(.int32)
+        let n = flat.dim(0)
         if n <= capacity {
             if n < capacity {
                 let padding = MLXArray.zeros([capacity - n], type: Int32.self)
-                buffer = concatenated([promptTokens.reshaped(-1), padding])
+                buffer = concatenated([flat, padding])
             } else {
-                buffer = promptTokens.reshaped(-1)
+                buffer = flat
             }
             count = n
             writeIndex = n % capacity
         } else {
-            buffer = promptTokens[(-capacity)...].reshaped(-1)
+            buffer = flat[(-capacity)...]
             count = capacity
             writeIndex = 0
         }
