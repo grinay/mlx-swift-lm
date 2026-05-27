@@ -36,7 +36,11 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
+        // Use the grinay/mlx-swift fork with -O3 Cmlx + libc++ hardening off
+        // + pthread stream lookup. The fork branches from 0.31.3 so the API
+        // surface this package consumes is identical; only the C++/Swift
+        // performance characteristics differ.
+        .package(url: "https://github.com/grinay/mlx-swift", branch: "perf/threadlocal-stream"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
     ],
     targets: [
