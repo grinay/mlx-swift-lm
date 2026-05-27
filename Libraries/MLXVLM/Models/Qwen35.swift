@@ -19,11 +19,21 @@ private enum Qwen35VLError: Error {
 
 // MARK: - Gated Delta Helpers
 
+// perf: wrap the gate computation in MLX.compile. Matches Python's
+// `@partial(mx.compile, shapeless=True) def compute_g(...)` in
+// mlx_lm.models.gated_delta. Fuses the 5-op expression (cast, exp, neg,
+// softplus, mul, exp) into a single Metal kernel launch instead of 5+
+// dispatches per SSM layer. Saves dispatch overhead in both prefill and
+// decode. `shapeless: true` so we don't recompile per sequence length.
+private let _computeGatedDeltaGCompiled: @Sendable (MLXArray, MLXArray, MLXArray)
+    -> MLXArray = MLX.compile(shapeless: true) { aLog, a, dtBias in
+        exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+    }
+
 private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray)
     -> MLXArray
 {
-    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay.asType(a.dtype)
+    _computeGatedDeltaGCompiled(aLog, a, dtBias).asType(a.dtype)
 }
 
 // MARK: - Gated Delta Metal Kernel (prefill fast path)
@@ -806,8 +816,20 @@ enum Qwen35Language {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            downProj(silu(gateProj(x)) * upProj(x))
+            downProj(Self.swiglu(gateProj(x), upProj(x)))
         }
+
+        // perf: fuse silu(gate) * up into one Metal kernel via MLX.compile.
+        // Unfused, MLX evaluates silu → writes [B, T, FFN] intermediate
+        // (12+ MB for Qwen3.5-2B at T=1087 prefill), then read+multiply →
+        // writes again. The compiled fusion reads gate+up once, computes
+        // silu(gate) * up in registers, writes output — cuts MLP elementwise
+        // memory traffic ~40%. Called 18× per prefill / per decode token.
+        private static let swiglu:
+            @Sendable (MLXArray, MLXArray) -> MLXArray = MLX.compile(shapeless: true) {
+                gate, up in
+                silu(gate) * up
+            }
     }
 
     final class GatedDeltaNet: Module {
