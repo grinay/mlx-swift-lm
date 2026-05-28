@@ -539,25 +539,42 @@ enum Qwen3VLVision {
             keys = keys.reshaped(1, sequenceLength, numHeads, headDim).transposed(0, 2, 1, 3)
             values = values.reshaped(1, sequenceLength, numHeads, headDim).transposed(0, 2, 1, 3)
 
-            var mask = ones([1, sequenceLength, sequenceLength], dtype: queries.dtype)
-            mask = mask * MLXArray(-1e9, dtype: queries.dtype)
-
+            // Chunked SDPA along the sequence axis using cu_seqlens. Mirrors
+            // mlx-vlm's `Attention.__call__` in qwen3_vl/vision.py — each
+            // image/tile is independent of the others, so the block-diagonal
+            // mask the previous implementation built was equivalent to
+            // running SDPA per chunk and concatenating.
+            //
+            // The previous code materialised a `[1, T, T]` mask and passed it
+            // as `.array(mask)`, which forced `MLXFast.scaledDotProductAttention`
+            // onto its naive softmax(QK^T)V fallback. For a full-resolution
+            // 3456×2234 screenshot (~7600 patches) the intermediate working
+            // set overflowed the 22 GB Metal single-buffer cap with a 29 GB
+            // attention tensor — the reason `ImageDecode.maxLongestSide` had
+            // to be clamped to 1280 in QwenOsx / Recall. Without an explicit
+            // mask each chunked call can dispatch to the flash-attention path
+            // and stays under the cap regardless of total sequence length.
             let seqlens = cuSeqlens.asArray(Int.self)
+            var chunks: [MLXArray] = []
+            chunks.reserveCapacity(seqlens.count - 1)
             for idx in 1 ..< seqlens.count {
                 let start = seqlens[idx - 1]
                 let end = seqlens[idx]
-                mask[0..., start ..< end, start ..< end] = MLXArray(0, dtype: queries.dtype)
+                let qChunk = queries[0..., 0..., start ..< end, 0...]
+                let kChunk = keys[0..., 0..., start ..< end, 0...]
+                let vChunk = values[0..., 0..., start ..< end, 0...]
+                let attended = MLXFast.scaledDotProductAttention(
+                    queries: qChunk,
+                    keys: kChunk,
+                    values: vChunk,
+                    scale: scale,
+                    mask: .none
+                )
+                chunks.append(attended)
             }
-
-            let attended = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: .array(mask)
-            )
-            .transposed(0, 2, 1, 3)
-            .reshaped(sequenceLength, -1)
+            let attended = MLX.concatenated(chunks, axis: 2)
+                .transposed(0, 2, 1, 3)
+                .reshaped(sequenceLength, -1)
 
             return proj(attended)
         }
