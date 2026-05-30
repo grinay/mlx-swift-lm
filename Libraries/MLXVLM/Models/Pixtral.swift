@@ -6,6 +6,12 @@ import MLXNN
 
 // Port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/pixtral
 
+// perf: fuse silu(gate) * up into a single Metal kernel via MLX.compile,
+// mirroring the Qwen35 SwiGLU fusion (commit c687780). Shared by the vision
+// and language MLPs below. Cuts MLP elementwise memory traffic ~40%.
+private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    MLX.compile(shapeless: true) { gate, up in silu(gate) * up }
+
 // MARK: - Vision Configuration
 
 public struct PixtralVisionConfiguration: Codable, Sendable {
@@ -294,15 +300,16 @@ internal enum PixtralVision {
                 sin: positionEmbeddings.sin
             )
 
-            // Scaled dot product attention
-            var attnWeights = MLX.matmul(queries, keys.transposed(0, 1, 3, 2)) * scale
-
-            if let mask {
-                attnWeights = attnWeights + mask
-            }
-
-            attnWeights = softmax(attnWeights, axis: -1)
-            let output = MLX.matmul(attnWeights, values)
+            // Flash scaled-dot-product attention. For the single-image case
+            // (the only path the processor allows) `mask` is nil, so SDPA takes
+            // the bounded flash kernel instead of materialising an L×L weight
+            // matrix per layer. The block-diagonal mask is built only for
+            // multi-image batches (see PixtralVisionModelInner).
+            let maskMode: MLXFast.ScaledDotProductAttentionMaskMode =
+                mask.map { .array($0) } ?? .none
+            let output = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values,
+                scale: scale, mask: maskMode)
 
             return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
         }
@@ -325,7 +332,7 @@ internal enum PixtralVision {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            downProj(silu(gateProj(x)) * upProj(x))
+            downProj(compiledSwiglu(gateProj(x), upProj(x)))
         }
     }
 
@@ -424,11 +431,16 @@ internal enum PixtralVision {
             // Generate block attention mask (supports multiple images in batch)
             let patchesPerImage = patchHeight * patchWidth
 
-            let mask = PixtralVision.generateBlockAttentionMask(
-                patchCounts: Array(repeating: patchesPerImage, count: batch),
-                batchSize: batch,
-                dtype: patchEmbeds.dtype
-            )
+            // Single image (the only supported path) needs no mask: every
+            // patch attends to every other patch, so the block-diagonal mask
+            // would be all-zeros. Skipping it lets attention take the flash
+            // SDPA path. Only multi-image batches need the block mask.
+            let mask: MLXArray? = batch > 1
+                ? PixtralVision.generateBlockAttentionMask(
+                    patchCounts: Array(repeating: patchesPerImage, count: batch),
+                    batchSize: batch,
+                    dtype: patchEmbeds.dtype)
+                : nil
 
             var encoderStates: [MLXArray]? = outputHiddenStates ? [patchEmbeds] : nil
             var h = patchEmbeds
@@ -598,7 +610,7 @@ private enum PixtralLanguage {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(silu(gate(x)) * up(x))
+            down(compiledSwiglu(gate(x), up(x)))
         }
     }
 

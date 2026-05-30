@@ -7,6 +7,11 @@ import MLXNN
 // Port of https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/mistral3
 // Note: Mistral3 reuses the vision model from Pixtral
 
+// perf: fuse silu(gate) * up into a single Metal kernel via MLX.compile,
+// mirroring the Qwen35 SwiGLU fusion (commit c687780).
+private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    MLX.compile(shapeless: true) { gate, up in silu(gate) * up }
+
 // MARK: - Configuration
 
 // Re-export PixtralVisionConfiguration for Mistral3 use
@@ -386,7 +391,7 @@ private enum Language {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(silu(gate(x)) * up(x))
+            down(compiledSwiglu(gate(x), up(x)))
         }
     }
 
@@ -671,54 +676,35 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         inputsEmbeds: MLXArray,
         inputIds: MLXArray
     ) -> MLXArray {
-        let (_, numImagePatches, _) = (
-            imageFeatures.dim(0),
-            imageFeatures.dim(1),
-            imageFeatures.dim(2)
-        )
+        // perf: pure-GPU masked scatter, mirroring the Qwen35 merge (commit
+        // f69f820). The previous path pulled inputIds to the CPU via
+        // `asArray` (a GPU→CPU sync every prefill), then split the image
+        // features into one slice *per patch* and concatenated — O(patches)
+        // Swift-side ops. The cumsum trick stays entirely on the GPU:
+        //   1. mask = (inputIds == imageToken), broadcast to the embed shape.
+        //   2. cumsum(mask)-1 gives, at each True position, its index into the
+        //      flattened image features (a stale index at False positions).
+        //   3. `% featuresSize` keeps the gather in bounds on False positions.
+        //   4. where(mask, gathered, embeds) selects the right value per slot.
+        // We trust the processor to emit exactly numImagePatches image tokens
+        // (the Python mlx-vlm impl makes the same assumption); a mismatch
+        // surfaces downstream rather than via a CPU-sync count here.
+        let mask = (inputIds .== MLXArray(Int32(imageTokenIndex)))
+        let specialMask = expandedDimensions(mask, axis: -1)
+        let maskExpanded = broadcast(specialMask, to: inputsEmbeds.shape)
 
-        // Find image token positions (assuming batch size is 1)
-        let inputIdArray: [Int32] = inputIds[0].asArray(Int32.self)
-        let imagePositions = inputIdArray.enumerated().compactMap {
-            $1 == Int32(imageTokenIndex) ? $0 : nil
-        }
+        let originalShape = inputsEmbeds.shape
+        let flattenedEmbeds = inputsEmbeds.flattened()
+        let flattenedFeatures = imageFeatures.flattened()
+        let flattenedMask = maskExpanded.flattened()
 
-        // Validate that the number of image tokens matches the number of image patches
-        guard imagePositions.count == numImagePatches else {
-            fatalError(
-                "Image token count (\(imagePositions.count)) does not match image patches (\(numImagePatches)). Ensure the processor adds exactly numImagePatches image tokens."
-            )
-        }
+        let maskInt = flattenedMask.asType(.int32)
+        let positionIndex = (cumsum(maskInt) - MLXArray(Int32(1))).asType(.int32)
+        let featuresSize = MLXArray(Int32(flattenedFeatures.size))
+        let aligned = MLX.take(flattenedFeatures, positionIndex % featuresSize, axis: 0)
+        let resultFlat = MLX.where(flattenedMask, aligned, flattenedEmbeds)
 
-        // Build text segments - text before each image token
-        var textSegments: [MLXArray] = []
-        var startIdx = 0
-
-        for position in imagePositions {
-            textSegments.append(inputsEmbeds[0..., startIdx ..< position, 0...])
-            startIdx = position + 1
-        }
-
-        // Split image features into separate embeddings for each image
-        // imageFeatures shape: (numImages, numImagePatches, embedDim)
-        // Split along axis 1 into numImagePatches parts (one per patch)
-        let splitIndices = Array(1 ..< numImagePatches)
-        let imageEmbeddings = MLX.split(imageFeatures, indices: splitIndices, axis: 1)
-
-        // Interleave text and image embeddings
-        // [text0, img0, text1, img1, ...]
-        var finalEmbeddings: [MLXArray] = []
-        for (text, image) in zip(textSegments, imageEmbeddings) {
-            finalEmbeddings.append(text)
-            finalEmbeddings.append(image)
-        }
-
-        // Add remaining text after the last image token
-        finalEmbeddings.append(inputsEmbeds[0..., startIdx..., 0...])
-
-        // Create a final embedding of shape
-        // (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return MLX.concatenated(finalEmbeddings, axis: 1)
+        return resultFlat.reshaped(originalShape)
     }
 
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
@@ -935,7 +921,9 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         var image = MediaProcessing.inSRGBToneCurveSpace(image)
         image = MediaProcessing.apply(image, processing: processing)
 
-        let maxVisionEdge = patchSize * 24  // Pixtral vision expects 24x24 patches (336px for patchSize=14)
+        // Honor the model's configured longest_edge (Pixtral native max = 1540).
+        // Was hardcoded to patchSize*24 = 336px, which crushed screenshot detail.
+        let maxVisionEdge = 1540
         let targetEdge = min(longestEdge ?? maxVisionEdge, maxVisionEdge)
 
         let originalSize = image.extent.size

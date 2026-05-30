@@ -5,6 +5,11 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// perf: fuse silu(gate) * up into a single Metal kernel via MLX.compile,
+// mirroring the Qwen35 SwiGLU fusion (commit c687780).
+private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    MLX.compile(shapeless: true) { gate, up in silu(gate) * up }
+
 // MARK: - Llama4 Attention Scaling
 
 /// Compute attention scale for Llama 4 style position-based scaling.
@@ -125,7 +130,7 @@ class Mistral3MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        return down(silu(gate(x)) * up(x))
+        return down(compiledSwiglu(gate(x), up(x)))
     }
 }
 
