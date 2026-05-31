@@ -186,6 +186,9 @@ private enum Language {
             mask: MLXArray? = nil
         ) -> LMOutput {
             var out = model(inputs, cache: cache, inputEmbedding: inputEmbedding, mask: mask)
+            // perf: generation uses only the last position's logits — project that
+            // token alone, not all L prefill positions, through the vocab-sized head.
+            if out.dim(1) > 1 { out = out[0..., (out.dim(1) - 1) ..< out.dim(1), 0...] }
             out = model.embedTokens.asLinear(out)
             return LMOutput(logits: out)
         }

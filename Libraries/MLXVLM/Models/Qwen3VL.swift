@@ -1328,6 +1328,9 @@ enum Qwen3VLLanguage {
                 visualMask: visualMask,
                 deepstackEmbeds: deepstackEmbeds)
 
+            // perf: generation uses only the last position's logits — project that
+            // token alone, not all L prefill positions, through the vocab-sized head.
+            if output.dim(1) > 1 { output = output[0..., (output.dim(1) - 1) ..< output.dim(1), 0...] }
             if let lmHead {
                 output = lmHead(output)
             } else {

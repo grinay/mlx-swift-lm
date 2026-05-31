@@ -1106,11 +1106,14 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
             perLayerInputs: perLayerInputs
         )
+        // perf: generation uses only the last position's logits — project that token
+        // alone, not all L prefill positions, through the vocab-sized head.
+        let lastOut = output.dim(1) > 1 ? output[0..., (output.dim(1) - 1) ..< output.dim(1), 0...] : output
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(output)
+            logits = lmHead(lastOut)
         } else {
-            logits = model.embedTokens.asLinear(output)
+            logits = model.embedTokens.asLinear(lastOut)
         }
         if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
             let scale = MLXArray(finalLogitSoftcapping)

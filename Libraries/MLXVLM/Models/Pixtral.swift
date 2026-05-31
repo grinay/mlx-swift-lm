@@ -716,6 +716,9 @@ private enum PixtralLanguage {
             inputsEmbeds: MLXArray? = nil
         ) -> MLXArray {
             var out = model(inputs, cache: cache, inputsEmbeds: inputsEmbeds)
+            // perf: generation uses only the last position's logits — project that
+            // token alone, not all L prefill positions, through the vocab-sized head.
+            if out.dim(1) > 1 { out = out[0..., (out.dim(1) - 1) ..< out.dim(1), 0...] }
             if config.tieWordEmbeddings {
                 out = model.embedTokens.asLinear(out)
             } else if let lmHead {

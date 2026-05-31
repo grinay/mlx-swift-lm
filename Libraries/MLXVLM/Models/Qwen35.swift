@@ -1255,6 +1255,9 @@ enum Qwen35Language {
                 positionIds: positionIds
             )
 
+            // perf: generation uses only the last position's logits — project that
+            // token alone, not all L prefill positions, through the vocab-sized head.
+            if out.dim(1) > 1 { out = out[0..., (out.dim(1) - 1) ..< out.dim(1), 0...] }
             if let lmHead {
                 out = lmHead(out)
             } else {

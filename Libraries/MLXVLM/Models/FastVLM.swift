@@ -277,6 +277,9 @@ private enum Language {
             _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
         ) -> LMOutput {
             var out = model(inputs, cache: cache, inputEmbedding: inputEmbedding)
+            // perf: generation uses only the last position's logits — project that
+            // token alone, not all L prefill positions, through the vocab-sized head.
+            if out.dim(1) > 1 { out = out[0..., (out.dim(1) - 1) ..< out.dim(1), 0...] }
             if let lmHead {
                 out = lmHead(out)
             } else {
