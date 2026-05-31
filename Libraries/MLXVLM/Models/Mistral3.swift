@@ -372,6 +372,63 @@ private enum Language {
 
             return wo(output)
         }
+
+        /// VisionZip/FastV-lite ranking signal: the attention the LAST query
+        /// token pays to every position at this layer, averaged over heads.
+        /// Single-query, so it needs no [L,L] materialization (flash SDPA hides
+        /// the full weights — this recomputes just the one row we need).
+        /// Returns shape [L]. Assumes B == 1 (single sequence).
+        func lastTokenAttentionScores(_ x: MLXArray, attentionScale: MLXArray) -> MLXArray {
+            let (B, L) = (x.dim(0), x.dim(1))
+            var queries = wq(x)
+            var keys = wk(x)
+            queries = queries.reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
+            keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            queries = rope(queries, offset: 0)
+            keys = rope(keys, offset: 0)
+            queries = queries * attentionScale
+            let repeats = nHeads / nKVHeads
+            if repeats > 1 {
+                keys = repeated(keys, count: repeats, axis: 1)
+            }
+            let qLast = queries[0..., 0..., (L - 1) ..< L, 0...]  // B, nHeads, 1, hd
+            var scores = matmul(qLast, keys.transposed(0, 1, 3, 2)) * scale  // B, nHeads, 1, L
+            scores = softmax(scores.asType(.float32), axis: -1)
+            return scores.mean(axis: 1).reshaped([L])  // average heads -> [L]
+        }
+
+        /// VisionZip "dominant token" signal: the mean attention each position
+        /// RECEIVES, averaged over heads and all causal query rows, at this layer
+        /// (the `attn[:, :, img_pos].mean(0,1)` criterion from the Python probe).
+        /// Chunked over queries so the full [L,L] map is never materialized.
+        /// Returns shape [L]. Assumes B == 1.
+        func receivedAttentionScores(
+            _ x: MLXArray, attentionScale: MLXArray, additiveMask: MLXArray
+        ) -> MLXArray {
+            let (B, L) = (x.dim(0), x.dim(1))
+            var queries = wq(x).reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
+            var keys = wk(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            queries = rope(queries, offset: 0)
+            keys = rope(keys, offset: 0)
+            queries = queries * attentionScale
+            let repeats = nHeads / nKVHeads
+            if repeats > 1 { keys = repeated(keys, count: repeats, axis: 1) }
+            let keysT = keys.transposed(0, 1, 3, 2)  // B, nHeads, hd, L
+            var acc: MLXArray? = nil  // per-key received-attention accumulator
+            let block = 512
+            var qs = 0
+            while qs < L {
+                let qe = min(qs + block, L)
+                let qb = queries[0..., 0..., qs ..< qe, 0...]  // B, nHeads, blk, hd
+                let sb = matmul(qb, keysT) * scale  // B, nHeads, blk, L
+                let probs = softmax(sb.asType(.float32) + additiveMask[qs ..< qe, 0...], axis: -1)
+                let contrib = probs.sum(axis: 2)  // B, nHeads, L
+                acc = (acc == nil) ? contrib : acc! + contrib
+                eval(acc!)
+                qs = qe
+            }
+            return (acc!.mean(axis: 1) / Float(L)).reshaped([L])  // mean heads -> [L]
+        }
     }
 
     // MARK: Language MLP
@@ -512,6 +569,54 @@ private enum Language {
 
             return norm(h)
         }
+
+        /// FastV-lite ranking: run the first `layerK` blocks over the full
+        /// (un-pruned) embeddings, then return the last token's attention over
+        /// every position at layer `layerK` (shape [L]). Used to rank visual
+        /// tokens for pruning. Cost ≈ layerK/numLayers of one prefill.
+        func imageRankScores(_ inputsEmbeds: MLXArray, layerK: Int) -> MLXArray {
+            var h = inputsEmbeds
+            let beta = config.ropeParameters?["llama_4_scaling_beta"]?.asFloat() ?? 0.0
+            let originalMaxPos =
+                config.ropeParameters?["original_max_position_embeddings"]?.asInt()
+                ?? config.maxPositionEmbeddings ?? 4096
+            let attentionScale = getLlama4AttentionScale(
+                start: 0, stop: h.dim(1), beta: beta, maxPositionEmbeddings: originalMaxPos
+            ).asType(h.dtype)
+            let mask = createAttentionMask(h: h, cache: nil as KVCache?)
+            let k = min(max(layerK, 0), layers.count - 1)
+            for i in 0 ..< k {
+                h = layers[i](h, attentionScale: attentionScale, mask: mask, cache: nil)
+            }
+            let xln = layers[k].inputLayerNorm(h)
+            return layers[k].attention.lastTokenAttentionScores(xln, attentionScale: attentionScale)
+        }
+
+        /// VisionZip dominant-token ranking: run the first `layerK` blocks, then
+        /// return the mean attention RECEIVED by every position (over heads + all
+        /// causal queries) at layer `layerK`. Shape [L].
+        func dominanceScores(_ inputsEmbeds: MLXArray, layerK: Int) -> MLXArray {
+            var h = inputsEmbeds
+            let beta = config.ropeParameters?["llama_4_scaling_beta"]?.asFloat() ?? 0.0
+            let originalMaxPos =
+                config.ropeParameters?["original_max_position_embeddings"]?.asInt()
+                ?? config.maxPositionEmbeddings ?? 4096
+            let attentionScale = getLlama4AttentionScale(
+                start: 0, stop: h.dim(1), beta: beta, maxPositionEmbeddings: originalMaxPos
+            ).asType(h.dtype)
+            let mask = createAttentionMask(h: h, cache: nil as KVCache?)
+            let k = min(max(layerK, 0), layers.count - 1)
+            for i in 0 ..< k {
+                h = layers[i](h, attentionScale: attentionScale, mask: mask, cache: nil)
+            }
+            let L = h.dim(1)
+            let rinds = MLXArray(Int32(0) ..< Int32(L))
+            let causal = rinds[0..., .newAxis] .>= rinds[.newAxis]  // [L,L] key<=query
+            let additive = MLX.where(causal, MLXArray(Float(0)), MLXArray(Float(-1e9)))
+            let xln = layers[k].inputLayerNorm(h)
+            return layers[k].attention.receivedAttentionScores(
+                xln, attentionScale: attentionScale, additiveMask: additive)
+        }
     }
 
     // MARK: Language Model
@@ -579,6 +684,16 @@ private enum Language {
             return out
         }
 
+        /// FastV-lite visual-token ranking (delegates to the inner model).
+        func imageRankScores(_ inputsEmbeds: MLXArray, layerK: Int) -> MLXArray {
+            model.imageRankScores(inputsEmbeds, layerK: layerK)
+        }
+
+        /// VisionZip dominant-token ranking (delegates to the inner model).
+        func dominanceScores(_ inputsEmbeds: MLXArray, layerK: Int) -> MLXArray {
+            model.dominanceScores(inputsEmbeds, layerK: layerK)
+        }
+
         func newCache(parameters: GenerateParameters?) -> [KVCache] {
             let layerTypes =
                 config.layerTypes
@@ -644,6 +759,10 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues = pixelValues.expandedDimensions(axis: 0)
         }
 
+        let prof = Self.profileEnabled
+        func ms() -> Double { Date().timeIntervalSince1970 * 1000 }
+        let t0 = ms()
+
         // Process through vision tower (reuses Pixtral vision model)
         let (_, _, hiddenStates) = visionTower(
             pixelValues.transposed(0, 2, 3, 1),
@@ -660,17 +779,99 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             ? hiddenStates.count + visionFeatureLayer
             : visionFeatureLayer
         let selectedFeatures = hiddenStates[layerIndex]
+        if prof { eval(selectedFeatures) }
+        let t1 = ms()
 
         // Project to text space using Mistral3's patch merger projector
         let imageFeatures = multiModalProjector(selectedFeatures, imageSizes: imageSizes)
 
         // Merge embeddings
-        return mergeInputIdsWithImageFeatures(
+        let fullEmbeds = mergeInputIdsWithImageFeatures(
             imageTokenIndex: config.imageTokenIndex,
             imageFeatures: imageFeatures,
             inputsEmbeds: inputsEmbeds,
             inputIds: inputIds
         )
+        if prof { eval(fullEmbeds) }
+        let t2 = ms()
+
+        // VisionZip / FastV-lite: attention-ranked visual-token pruning (env-gated
+        // via VISIONZIP_KEEP). The LM ignores inputIds when inputsEmbeds is given,
+        // so pruning the embeddings alone shortens the prefill; KV-cache length and
+        // RoPE positions follow the pruned sequence automatically.
+        guard let keep = Self.visionZipKeep, keep < 1.0, inputIds.dim(0) == 1 else {
+            Self.profileTimes = (vision: t1 - t0, merge: t2 - t1, rank: 0)
+            return fullEmbeds
+        }
+        let pruned = pruneVisualTokens(fullEmbeds: fullEmbeds, inputIds: inputIds, keep: keep)
+        if prof { eval(pruned) }
+        Self.profileTimes = (vision: t1 - t0, merge: t2 - t1, rank: ms() - t2)
+        return pruned
+    }
+
+    /// VISIONZIP_KEEP: fraction of visual tokens to retain (e.g. 0.2 = keep 20%).
+    private static var visionZipKeep: Float? {
+        guard let s = ProcessInfo.processInfo.environment["VISIONZIP_KEEP"],
+            let v = Float(s) else { return nil }
+        return v
+    }
+    /// VISIONZIP_LAYER: LM layer whose last-token attention ranks the tokens.
+    private static var visionZipLayer: Int {
+        ProcessInfo.processInfo.environment["VISIONZIP_LAYER"].flatMap { Int($0) } ?? 3
+    }
+    /// VISIONZIP_PROFILE: when set, getInputEmbeddings/prepare time each phase
+    /// (vision encode / merge / ranking / LM prefill) with eval() barriers.
+    private static var profileEnabled: Bool {
+        ProcessInfo.processInfo.environment["VISIONZIP_PROFILE"] != nil
+    }
+    /// Sub-phase times (ms) stashed by getInputEmbeddings for prepare() to print.
+    nonisolated(unsafe) static var profileTimes: (vision: Double, merge: Double, rank: Double) = (0, 0, 0)
+
+    /// Keep the top-`keep` fraction of image tokens by FastV attention score,
+    /// drop the rest, and keep every non-image position. Returns the pruned
+    /// embeddings (shorter sequence). One CPU sync for the ranking — prefill only.
+    private func pruneVisualTokens(fullEmbeds: MLXArray, inputIds: MLXArray, keep: Float)
+        -> MLXArray
+    {
+        let L = fullEmbeds.dim(1)
+        let imgTok = Int32(config.imageTokenIndex)
+        let idsRow = inputIds[0].asType(.int32).asArray(Int32.self)
+        var imgPos = [Int]()
+        for (i, t) in idsRow.enumerated() where t == imgTok { imgPos.append(i) }
+        let n = imgPos.count
+        let k = max(1, Int((Float(n) * keep).rounded()))
+        if n == 0 || k >= n { return fullEmbeds }
+
+        // VISIONZIP_STRATEGY: "visionzip" (dominant tokens = attention received,
+        // default), "fastv" (last-token attention), or "uniform" (evenly-spaced
+        // control). VisionZip is the method matched to the Python probe.
+        let strategy = ProcessInfo.processInfo.environment["VISIONZIP_STRATEGY"] ?? "visionzip"
+        let layerK = Self.visionZipLayer
+        let keepImg: Set<Int>
+        switch strategy {
+        case "uniform":
+            let step = Double(n) / Double(k)
+            keepImg = Set((0 ..< k).map { imgPos[min(n - 1, Int(Double($0) * step))] })
+        case "fastv":
+            let scores = languageModel.imageRankScores(fullEmbeds, layerK: layerK)
+                .asArray(Float.self)
+            keepImg = Set(imgPos.sorted { scores[$0] > scores[$1] }.prefix(k))
+        default:  // "visionzip"
+            let scores = languageModel.dominanceScores(fullEmbeds, layerK: layerK)
+                .asArray(Float.self)
+            keepImg = Set(imgPos.sorted { scores[$0] > scores[$1] }.prefix(k))
+        }
+
+        var keepIdx = [Int32]()
+        keepIdx.reserveCapacity(L - (n - k))
+        for i in 0 ..< L where idsRow[i] != imgTok || keepImg.contains(i) {
+            keepIdx.append(Int32(i))
+        }
+        let pruned = MLX.take(fullEmbeds, MLXArray(keepIdx), axis: 1)
+        if ProcessInfo.processInfo.environment["VISIONZIP_LOG"] != nil {
+            print("[visionzip] keep=\(keep) strat=\(strategy) layer=\(layerK): \(n) img -> \(k); seq \(L) -> \(pruned.dim(1))")
+        }
+        return pruned
     }
 
     private func mergeInputIdsWithImageFeatures(
@@ -732,7 +933,18 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             imageSizes: imageSizes
         )
 
+        let prof = Self.profileEnabled
+        let tLm0 = Date().timeIntervalSince1970 * 1000
         let logits = languageModel(inputIds, cache: cache, inputsEmbeds: embeddings)
+        if prof {
+            eval(logits)
+            let lm = Date().timeIntervalSince1970 * 1000 - tLm0
+            let p = Self.profileTimes
+            print(String(
+                format:
+                    "[breakdown] vision=%.0fms  merge=%.0fms  rank=%.0fms  lm_prefill=%.0fms  | seq=%d→%d",
+                p.vision, p.merge, p.rank, lm, inputIds.dim(1), embeddings.dim(1)))
+        }
         return .logits(.init(logits: logits))
     }
 
