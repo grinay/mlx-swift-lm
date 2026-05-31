@@ -744,7 +744,7 @@ enum Qwen35Language {
 
         func callAsFunction(
             _ x: MLXArray,
-            mask: MLXArray?,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode,
             cache: KVCache?,
             positionIds: MLXArray?
         ) -> MLXArray {
@@ -781,11 +781,16 @@ enum Qwen35Language {
             (queries, keys) = applyMultimodalRotaryPosEmb(
                 q: queries, k: keys, cos: cosValues, sin: sinValues)
 
+            // perf/mem: keep the mask symbolic. createAttentionMask yields `.causal`
+            // for unpadded prefill, so the flash kernel skips the upper triangle and
+            // we never materialize the [L,L] mask (saving scales with res²: ~10MB
+            // @1600, ~70MB @2560). Only `.array` (padded/batched) needs the kvSeqLen
+            // slice — QwenOsx is single-sequence so this is `.causal`. Numerics identical.
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
-            if let mask {
-                attentionMask = .array(mask[.ellipsis, 0 ..< kvSeqLen])
+            if case .array(let m) = mask {
+                attentionMask = .array(m[.ellipsis, 0 ..< kvSeqLen])
             } else {
-                attentionMask = .none
+                attentionMask = mask
             }
 
             let output = attentionWithCacheUpdate(
@@ -1053,7 +1058,7 @@ enum Qwen35Language {
 
         func callAsFunction(
             _ x: MLXArray,
-            attentionMask: MLXArray?,
+            attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
             ssmMask: MLXArray?,
             cache: KVCache?,
             positionIds: MLXArray?
@@ -1111,21 +1116,19 @@ enum Qwen35Language {
                 cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
             }
 
+            // perf/mem: symbolic mask (.causal for unpadded prefill) instead of a
+            // materialized [L,L] array — flash kernel skips the upper triangle and
+            // avoids the mask allocation (saving grows with res²). .array only when
+            // the cache/padding requires it.
             let faMaskMode = createAttentionMask(
-                h: hiddenStates, cache: cacheArray?[faIdx], returnArray: true)
-            let faMask: MLXArray?
-            if case .array(let arrayMask) = faMaskMode {
-                faMask = arrayMask
-            } else {
-                faMask = nil
-            }
+                h: hiddenStates, cache: cacheArray?[faIdx], returnArray: false)
             let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
             for (index, layer) in layers.enumerated() {
                 let layerSSMMask = layer.isLinear ? ssmMask : nil
                 hiddenStates = layer(
                     hiddenStates,
-                    attentionMask: faMask,
+                    attentionMask: faMaskMode,
                     ssmMask: layerSSMMask,
                     cache: cacheArray?[index],
                     positionIds: positionIds
