@@ -131,6 +131,21 @@ public struct PixtralConfiguration: Codable, Sendable {
 
 // MARK: - Vision Model
 
+/// App-owned VLCache storage for ONE context (one screen/window stream). The engine
+/// keeps one handle per `contextKey` and sets the active one (via `Mistral3VLM.setVLCache`)
+/// before each inference. Reference type — engine owns lifecycle (LRU / budget / invalidate).
+///   crop-encode → `mergeTokens` (~4 MB @1540, many contexts).
+///   faithful    → `perLayerK/V` + `finalHidden` (~0.5 GB @1540, 1–2 contexts).
+public final class VLCacheHandle {
+    var perLayerK: [Int: MLXArray] = [:]
+    var perLayerV: [Int: MLXArray] = [:]
+    var finalHidden: MLXArray?
+    var mergeTokens: MLXArray?
+    public init() {}
+    public func clear() { perLayerK = [:]; perLayerV = [:]; finalHidden = nil; mergeTokens = nil }
+    public var hasRecording: Bool { finalHidden != nil || mergeTokens != nil }
+}
+
 /// Pixtral vision model namespace - contains all vision-related components
 /// These are made internal so they can be reused by Mistral3
 internal enum PixtralVision {
@@ -217,16 +232,18 @@ internal enum PixtralVision {
         return (qEmbed, kEmbed)
     }
 
-    // MARK: Faithful VLCache (per-layer K,V cache + incremental encode)
-    nonisolated(unsafe) static var cachedK = [Int: MLXArray]()
-    nonisolated(unsafe) static var cachedV = [Int: MLXArray]()
-    nonisolated(unsafe) static var cachedFinalHidden: MLXArray? = nil
-    /// Called from Attention during the "record" pass to stash per-layer post-RoPE K,V.
+    // MARK: VLCache storage (per-context, app-owned)
+    /// Active handle for the current inference (engine sets it; nil → shared default).
+    nonisolated(unsafe) public static var activeHandle: VLCacheHandle?
+    private static let defaultHandle = VLCacheHandle()
+    static var current: VLCacheHandle { activeHandle ?? defaultHandle }
+
+    /// Called from Attention during the faithful "record" pass to stash per-layer K,V.
     static func recordKV(_ layer: Int, _ k: MLXArray, _ v: MLXArray) {
         if ProcessInfo.processInfo.environment["VLCACHE_FAITHFUL"] == "record" {
             eval(k, v)
-            cachedK[layer] = k
-            cachedV[layer] = v
+            current.perLayerK[layer] = k
+            current.perLayerV[layer] = v
         }
     }
 
@@ -510,10 +527,10 @@ internal enum PixtralVision {
                     h = layer(h, positionEmbeddings: positionEmbedding, mask: mask, layerIdx: l)
                 }
                 eval(h)
-                PixtralVision.cachedFinalHidden = h
+                PixtralVision.current.finalHidden = h
                 return (h, outputHiddenStates ? [patchEmbeds, h] : nil)
             }
-            if faithful == "incremental", let cachedFinal = PixtralVision.cachedFinalHidden,
+            if faithful == "incremental", let cachedFinal = PixtralVision.current.finalHidden,
                 let bboxStr = ProcessInfo.processInfo.environment["VLCACHE_BBOX"] {
                 let nP = patchHeight * patchWidth
                 let p = bboxStr.split(separator: ",").compactMap { Double($0) }
@@ -535,7 +552,8 @@ internal enum PixtralVision {
                 for t in 0 ..< nP { gi[t] = rankOf[t].map { Int32(nP + $0) } ?? Int32(t) }
                 let gatherIdx = MLXArray(gi)
                 for (l, layer) in transformer.layers.enumerated() {
-                    guard let ck = PixtralVision.cachedK[l], let cv = PixtralVision.cachedV[l] else { break }
+                    guard let ck = PixtralVision.current.perLayerK[l],
+                        let cv = PixtralVision.current.perLayerV[l] else { break }
                     xC = layer.incremental(
                         xC, posCos: posCos, posSin: posSin, cachedK: ck, cachedV: cv, gatherIdx: gatherIdx)
                 }

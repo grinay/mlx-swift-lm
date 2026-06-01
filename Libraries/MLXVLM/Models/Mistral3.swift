@@ -770,7 +770,7 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         let imageFeatures: MLXArray
         let t1: Double
         if ProcessInfo.processInfo.environment["VLCACHE_MODE"] == "cropencode",
-            let cached = Self.vlcacheTokens,
+            let cached = PixtralVision.current.mergeTokens,
             let bboxStr = ProcessInfo.processInfo.environment["VLCACHE_BBOX"] {
             // VLCache crop-encode: encode ONLY the changed region (with full-frame
             // position offset) and splice into cached full-frame tokens. The encoder
@@ -831,8 +831,9 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         return pruned
     }
 
-    /// VLCache token cache (post-merge image tokens of the last "record" frame).
-    nonisolated(unsafe) static var vlcacheTokens: MLXArray? = nil
+    /// Set the active VLCache handle for the next inference(s). Engine owns one per
+    /// context and calls this before generate; nil uses the shared default.
+    public func setVLCache(_ handle: VLCacheHandle?) { PixtralVision.activeHandle = handle }
 
     /// Splice freshly-encoded crop tokens into the cached full-frame token grid by
     /// position. Changed-region grid cells take the crop tokens (encoded with the
@@ -869,10 +870,10 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         guard let mode = ProcessInfo.processInfo.environment["VLCACHE_MODE"] else { return feats }
         if mode == "record" {
             eval(feats)
-            Self.vlcacheTokens = feats
+            PixtralVision.current.mergeTokens = feats
             return feats
         }
-        guard mode == "splice", let cached = Self.vlcacheTokens,
+        guard mode == "splice", let cached = PixtralVision.current.mergeTokens,
             cached.dim(1) == feats.dim(1), let (h, w) = imageSizes.first
         else { return feats }
         let n = feats.dim(1)
