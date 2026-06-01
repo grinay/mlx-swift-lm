@@ -235,7 +235,7 @@ internal enum PixtralVision {
     // MARK: VLCache storage (per-context, app-owned)
     /// Active handle for the current inference (engine sets it; nil → shared default).
     nonisolated(unsafe) public static var activeHandle: VLCacheHandle?
-    private static let defaultHandle = VLCacheHandle()
+    nonisolated(unsafe) private static let defaultHandle = VLCacheHandle()
     static var current: VLCacheHandle { activeHandle ?? defaultHandle }
 
     /// Called from Attention during the faithful "record" pass to stash per-layer K,V.
