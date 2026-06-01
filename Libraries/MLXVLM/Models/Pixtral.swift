@@ -217,6 +217,19 @@ internal enum PixtralVision {
         return (qEmbed, kEmbed)
     }
 
+    // MARK: Faithful VLCache (per-layer K,V cache + incremental encode)
+    nonisolated(unsafe) static var cachedK = [Int: MLXArray]()
+    nonisolated(unsafe) static var cachedV = [Int: MLXArray]()
+    nonisolated(unsafe) static var cachedFinalHidden: MLXArray? = nil
+    /// Called from Attention during the "record" pass to stash per-layer post-RoPE K,V.
+    static func recordKV(_ layer: Int, _ k: MLXArray, _ v: MLXArray) {
+        if ProcessInfo.processInfo.environment["VLCACHE_FAITHFUL"] == "record" {
+            eval(k, v)
+            cachedK[layer] = k
+            cachedV[layer] = v
+        }
+    }
+
     /// Generate a block-diagonal attention mask so that separate images
     /// in the batch do not attend to each other.
     ///
@@ -293,7 +306,8 @@ internal enum PixtralVision {
         func callAsFunction(
             _ x: MLXArray,
             positionEmbeddings: (cos: MLXArray, sin: MLXArray),
-            mask: MLXArray? = nil
+            mask: MLXArray? = nil,
+            layerIdx: Int? = nil
         ) -> MLXArray {
             let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -319,7 +333,28 @@ internal enum PixtralVision {
                 queries: queries, keys: keys, values: values,
                 scale: scale, mask: maskMode)
 
+            if let li = layerIdx { PixtralVision.recordKV(li, keys, values) }
+
             return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        }
+
+        /// Faithful-VLCache incremental attention: `xChanged` are ONLY the changed
+        /// patches; they attend over the FULL key set (cached unchanged K,V from
+        /// frame 0, with changed rows replaced by fresh). Returns changed-patch outputs.
+        func incrementalAttention(
+            _ xChanged: MLXArray, posCos: MLXArray, posSin: MLXArray,
+            cachedK: MLXArray, cachedV: MLXArray, gatherIdx: MLXArray
+        ) -> MLXArray {
+            let (B, Kc) = (xChanged.dim(0), xChanged.dim(1))
+            var q = qProj(xChanged).reshaped(B, Kc, numHeads, headDim).transposed(0, 2, 1, 3)
+            var kc = kProj(xChanged).reshaped(B, Kc, numHeads, headDim).transposed(0, 2, 1, 3)
+            let vc = vProj(xChanged).reshaped(B, Kc, numHeads, headDim).transposed(0, 2, 1, 3)
+            (q, kc) = PixtralVision.applyRotaryPosEmb(q: q, k: kc, cos: posCos, sin: posSin)
+            let kFull = MLX.take(MLX.concatenated([cachedK, kc], axis: 2), gatherIdx, axis: 2)
+            let vFull = MLX.take(MLX.concatenated([cachedV, vc], axis: 2), gatherIdx, axis: 2)
+            let out = MLXFast.scaledDotProductAttention(
+                queries: q, keys: kFull, values: vFull, scale: scale, mask: .none)
+            return oProj(out.transposed(0, 2, 1, 3).reshaped(B, Kc, -1))
         }
     }
 
@@ -364,11 +399,28 @@ internal enum PixtralVision {
         func callAsFunction(
             _ x: MLXArray,
             positionEmbeddings: (cos: MLXArray, sin: MLXArray),
-            mask: MLXArray? = nil
+            mask: MLXArray? = nil,
+            layerIdx: Int? = nil
         ) -> MLXArray {
             let y = attentionNorm(x)
-            let attnOut = attention(y, positionEmbeddings: positionEmbeddings, mask: mask)
+            let attnOut = attention(
+                y, positionEmbeddings: positionEmbeddings, mask: mask, layerIdx: layerIdx)
             let h = x + attnOut
+            let ffnOut = feedForward(ffnNorm(h))
+            return h + ffnOut
+        }
+
+        /// Faithful-VLCache incremental layer: process ONLY the changed patches; their
+        /// attention runs over the full (cached + fresh) key set.
+        func incremental(
+            _ xChanged: MLXArray, posCos: MLXArray, posSin: MLXArray,
+            cachedK: MLXArray, cachedV: MLXArray, gatherIdx: MLXArray
+        ) -> MLXArray {
+            let y = attentionNorm(xChanged)
+            let attnOut = attention.incrementalAttention(
+                y, posCos: posCos, posSin: posSin,
+                cachedK: cachedK, cachedV: cachedV, gatherIdx: gatherIdx)
+            let h = xChanged + attnOut
             let ffnOut = feedForward(ffnNorm(h))
             return h + ffnOut
         }
@@ -450,11 +502,53 @@ internal enum PixtralVision {
                     dtype: patchEmbeds.dtype)
                 : nil
 
+            // Faithful VLCache (full attention, no kernel — rectangular SDPA).
+            let faithful = ProcessInfo.processInfo.environment["VLCACHE_FAITHFUL"]
+            if faithful == "record" {
+                var h = patchEmbeds
+                for (l, layer) in transformer.layers.enumerated() {
+                    h = layer(h, positionEmbeddings: positionEmbedding, mask: mask, layerIdx: l)
+                }
+                eval(h)
+                PixtralVision.cachedFinalHidden = h
+                return (h, outputHiddenStates ? [patchEmbeds, h] : nil)
+            }
+            if faithful == "incremental", let cachedFinal = PixtralVision.cachedFinalHidden,
+                let bboxStr = ProcessInfo.processInfo.environment["VLCACHE_BBOX"] {
+                let nP = patchHeight * patchWidth
+                let p = bboxStr.split(separator: ",").compactMap { Double($0) }
+                let r0 = Int(Double(patchHeight) * p[1]), r1 = Int((Double(patchHeight) * p[3]).rounded(.up))
+                let c0 = Int(Double(patchWidth) * p[0]), c1 = Int((Double(patchWidth) * p[2]).rounded(.up))
+                var changed = [Int32]()
+                for r in 0 ..< patchHeight {
+                    for c in 0 ..< patchWidth where r >= r0 && r < r1 && c >= c0 && c < c1 {
+                        changed.append(Int32(r * patchWidth + c))
+                    }
+                }
+                let kc = changed.count
+                let changedArr = MLXArray(changed)
+                var xC = MLX.take(patchEmbeds, changedArr, axis: 1)  // [B, Kc, d]
+                let posCos = MLX.take(positionEmbedding.cos, changedArr, axis: 0)  // [Kc, hd]
+                let posSin = MLX.take(positionEmbedding.sin, changedArr, axis: 0)
+                var rankOf = [Int: Int](); for (j, t) in changed.enumerated() { rankOf[Int(t)] = j }
+                var gi = [Int32](repeating: 0, count: nP)
+                for t in 0 ..< nP { gi[t] = rankOf[t].map { Int32(nP + $0) } ?? Int32(t) }
+                let gatherIdx = MLXArray(gi)
+                for (l, layer) in transformer.layers.enumerated() {
+                    guard let ck = PixtralVision.cachedK[l], let cv = PixtralVision.cachedV[l] else { break }
+                    xC = layer.incremental(
+                        xC, posCos: posCos, posSin: posSin, cachedK: ck, cachedV: cv, gatherIdx: gatherIdx)
+                }
+                let h = MLX.take(MLX.concatenated([cachedFinal, xC], axis: 1), gatherIdx, axis: 1)  // [B,N,d]
+                if ProcessInfo.processInfo.environment["VISIONZIP_LOG"] != nil {
+                    print("[vlcache-faithful] patches=\(nP) changed=\(kc) reused=\(nP - kc)")
+                }
+                return (h, outputHiddenStates ? [patchEmbeds, h] : nil)
+            }
+
             var encoderStates: [MLXArray]? = outputHiddenStates ? [patchEmbeds] : nil
             var h = patchEmbeds
-
-            // VISION_MAX_LAYERS: early-exit — run only the first N encoder layers
-            // (text features form early; skipping late layers cuts encoder compute).
+            // VISION_MAX_LAYERS: early-exit — run only the first N encoder layers.
             let maxLayers = ProcessInfo.processInfo.environment["VISION_MAX_LAYERS"]
                 .flatMap { Int($0) }
             var li = 0
