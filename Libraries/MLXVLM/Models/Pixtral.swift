@@ -250,10 +250,18 @@ internal enum PixtralVision {
     /// Generate position IDs in a meshgrid pattern for patches
     static func positionIdsInMeshgrid(patchHeight: Int, patchWidth: Int, maxWidth: Int) -> MLXArray
     {
+        // VISION_POS_OFFSET="rowOff,colOff": shift patch positions so a CROP gets the
+        // positions it occupies in the FULL frame (VLCache crop-encode). 2D RoPE is
+        // mostly relative, but this keeps absolute positions consistent with the cache.
+        var rOff = 0, cOff = 0
+        if let s = ProcessInfo.processInfo.environment["VISION_POS_OFFSET"] {
+            let p = s.split(separator: ",").compactMap { Int($0) }
+            if p.count == 2 { rOff = p[0]; cOff = p[1] }
+        }
         var positions: [Int32] = []
         for h in 0 ..< patchHeight {
             for w in 0 ..< patchWidth {
-                positions.append(Int32(h * maxWidth + w))
+                positions.append(Int32((h + rOff) * maxWidth + (w + cOff)))
             }
         }
         return MLXArray(positions)
@@ -445,11 +453,18 @@ internal enum PixtralVision {
             var encoderStates: [MLXArray]? = outputHiddenStates ? [patchEmbeds] : nil
             var h = patchEmbeds
 
+            // VISION_MAX_LAYERS: early-exit — run only the first N encoder layers
+            // (text features form early; skipping late layers cuts encoder compute).
+            let maxLayers = ProcessInfo.processInfo.environment["VISION_MAX_LAYERS"]
+                .flatMap { Int($0) }
+            var li = 0
             for layer in transformer.layers {
+                if let maxLayers, li >= maxLayers { break }
                 h = layer(h, positionEmbeddings: positionEmbedding, mask: mask)
                 if outputHiddenStates {
                     encoderStates?.append(h)
                 }
+                li += 1
             }
 
             return (h, encoderStates)

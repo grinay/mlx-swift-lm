@@ -762,28 +762,50 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         let prof = Self.profileEnabled
         func ms() -> Double { Date().timeIntervalSince1970 * 1000 }
         let t0 = ms()
-
-        // Process through vision tower (reuses Pixtral vision model)
-        let (_, _, hiddenStates) = visionTower(
-            pixelValues.transposed(0, 2, 3, 1),
-            outputHiddenStates: true
-        )
-
-        // Select features from specified layer
-        guard let hiddenStates else {
-            fatalError("Vision model must return hidden states")
+        func selLayer(_ hs: [MLXArray]) -> MLXArray {
+            let i = visionFeatureLayer < 0 ? hs.count + visionFeatureLayer : visionFeatureLayer
+            return hs[i]
         }
 
-        let layerIndex =
-            visionFeatureLayer < 0
-            ? hiddenStates.count + visionFeatureLayer
-            : visionFeatureLayer
-        let selectedFeatures = hiddenStates[layerIndex]
-        if prof { eval(selectedFeatures) }
-        let t1 = ms()
-
-        // Project to text space using Mistral3's patch merger projector
-        let imageFeatures = multiModalProjector(selectedFeatures, imageSizes: imageSizes)
+        let imageFeatures: MLXArray
+        let t1: Double
+        if ProcessInfo.processInfo.environment["VLCACHE_MODE"] == "cropencode",
+            let cached = Self.vlcacheTokens,
+            let bboxStr = ProcessInfo.processInfo.environment["VLCACHE_BBOX"] {
+            // VLCache crop-encode: encode ONLY the changed region (with full-frame
+            // position offset) and splice into cached full-frame tokens. The encoder
+            // runs on the crop, not the full frame — the real timing win.
+            let H = pixelValues.dim(2), W = pixelValues.dim(3)
+            let p = bboxStr.split(separator: ",").compactMap { Double($0) }
+            let x0 = (Int(Double(W) * p[0]) / 28) * 28
+            let y0 = (Int(Double(H) * p[1]) / 28) * 28
+            let x1 = min(W, ((Int(Double(W) * p[2]) + 27) / 28) * 28)
+            let y1 = min(H, ((Int(Double(H) * p[3]) + 27) / 28) * 28)
+            let cropPix = pixelValues[0..., 0..., y0 ..< y1, x0 ..< x1]
+            setenv("VISION_POS_OFFSET", "\(y0 / 14),\(x0 / 14)", 1)
+            let (_, _, cropHidden) = visionTower(cropPix.transposed(0, 2, 3, 1), outputHiddenStates: true)
+            unsetenv("VISION_POS_OFFSET")
+            let cropSel = selLayer(cropHidden!)
+            if prof { eval(cropSel) }
+            t1 = ms()
+            let cropMerged = multiModalProjector(cropSel, imageSizes: [(y1 - y0, x1 - x0)])
+            imageFeatures = Self.spliceCrop(
+                cached: cached, crop: cropMerged,
+                fullGridW: W / 28, fullGridH: H / 28,
+                gr0: y0 / 28, gc0: x0 / 28,
+                cropGridW: (x1 - x0) / 28, cropGridH: (y1 - y0) / 28)
+        } else {
+            // Process through vision tower (reuses Pixtral vision model)
+            let (_, _, hiddenStates) = visionTower(
+                pixelValues.transposed(0, 2, 3, 1), outputHiddenStates: true)
+            guard let hiddenStates else { fatalError("Vision model must return hidden states") }
+            let selectedFeatures = selLayer(hiddenStates)
+            if prof { eval(selectedFeatures) }
+            t1 = ms()
+            // VLCache Option-2 splice (validation path): cached static + fresh changed.
+            imageFeatures = applyVLCacheSplice(
+                multiModalProjector(selectedFeatures, imageSizes: imageSizes), imageSizes: imageSizes)
+        }
 
         // Merge embeddings
         let fullEmbeds = mergeInputIdsWithImageFeatures(
@@ -807,6 +829,76 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         if prof { eval(pruned) }
         Self.profileTimes = (vision: t1 - t0, merge: t2 - t1, rank: ms() - t2)
         return pruned
+    }
+
+    /// VLCache token cache (post-merge image tokens of the last "record" frame).
+    nonisolated(unsafe) static var vlcacheTokens: MLXArray? = nil
+
+    /// Splice freshly-encoded crop tokens into the cached full-frame token grid by
+    /// position. Changed-region grid cells take the crop tokens (encoded with the
+    /// matching full-frame position offset); everything else reuses the cache.
+    private static func spliceCrop(
+        cached: MLXArray, crop: MLXArray,
+        fullGridW: Int, fullGridH: Int, gr0: Int, gc0: Int, cropGridW: Int, cropGridH: Int
+    ) -> MLXArray {
+        let nFull = fullGridW * fullGridH
+        guard cached.dim(1) == nFull else { return cached }  // grid mismatch -> safe fallback
+        var gi = [Int32](repeating: 0, count: nFull)
+        for t in 0 ..< nFull {
+            let r = t / fullGridW, c = t % fullGridW
+            if r >= gr0 && r < gr0 + cropGridH && c >= gc0 && c < gc0 + cropGridW {
+                gi[t] = Int32(nFull + (r - gr0) * cropGridW + (c - gc0))
+            } else {
+                gi[t] = Int32(t)
+            }
+        }
+        if ProcessInfo.processInfo.environment["VISIONZIP_LOG"] != nil {
+            print("[vlcache] cropencode: full \(fullGridW)x\(fullGridH)=\(nFull), crop \(cropGridW)x\(cropGridH)=\(crop.dim(1)) at (\(gr0),\(gc0)); reused \(nFull - cropGridW * cropGridH)")
+        }
+        let combined = MLX.concatenated([cached[0], crop[0]], axis: 0)
+        return MLX.take(combined, MLXArray(gi), axis: 0)[.newAxis, 0..., 0...]
+    }
+
+    /// VLCache Option-2 splice (env-gated, token-level reuse).
+    ///   VLCACHE_MODE=record  -> cache this frame's post-merge image tokens.
+    ///   VLCACHE_MODE=splice  -> keep cached tokens OUTSIDE the changed bbox
+    ///       (VLCACHE_BBOX="fx0,fy0,fx1,fy1" in [0,1]); use this frame's tokens inside.
+    /// Reuses cached encoded tokens for the static region, validating whether a
+    /// spliced (cached static + fresh changed) token sequence yields correct OCR.
+    private func applyVLCacheSplice(_ feats: MLXArray, imageSizes: [(Int, Int)]) -> MLXArray {
+        guard let mode = ProcessInfo.processInfo.environment["VLCACHE_MODE"] else { return feats }
+        if mode == "record" {
+            eval(feats)
+            Self.vlcacheTokens = feats
+            return feats
+        }
+        guard mode == "splice", let cached = Self.vlcacheTokens,
+            cached.dim(1) == feats.dim(1), let (h, w) = imageSizes.first
+        else { return feats }
+        let n = feats.dim(1)
+        // Recover the merged grid (gridW × gridH = n, aspect ≈ w/h, row-major).
+        let aspect = Double(w) / Double(h)
+        var gridW = max(1, Int((Double(n) * aspect).squareRoot().rounded()))
+        while gridW > 1 && n % gridW != 0 { gridW -= 1 }
+        let gridH = n / gridW
+        let p = (ProcessInfo.processInfo.environment["VLCACHE_BBOX"] ?? "0,0,1,1")
+            .split(separator: ",").compactMap { Double($0) }
+        guard p.count == 4 else { return feats }
+        let (fx0, fy0, fx1, fy1) = (p[0], p[1], p[2], p[3])
+        // mask[t] = 1.0 -> reuse cached (token OUTSIDE the changed bbox), 0.0 -> fresh.
+        var m = [Float](repeating: 0, count: n)
+        for t in 0 ..< n {
+            let r = Double(t / gridW) / Double(gridH)
+            let c = Double(t % gridW) / Double(gridW)
+            let inside = c >= fx0 && c <= fx1 && r >= fy0 && r <= fy1
+            m[t] = inside ? 0.0 : 1.0
+        }
+        let reused = m.reduce(0) { $0 + ($1 > 0.5 ? 1 : 0) }
+        let mask = MLXArray(m).reshaped([1, n, 1]).asType(feats.dtype)
+        if ProcessInfo.processInfo.environment["VISIONZIP_LOG"] != nil {
+            print("[vlcache] splice grid=\(gridW)x\(gridH) n=\(n): reused \(reused) cached, \(n - reused) fresh")
+        }
+        return mask * cached.asType(feats.dtype) + (MLXArray(Float(1)).asType(feats.dtype) - mask) * feats
     }
 
     /// VISIONZIP_KEEP: fraction of visual tokens to retain (e.g. 0.2 = keep 20%).
@@ -859,7 +951,11 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         default:  // "visionzip"
             let scores = languageModel.dominanceScores(fullEmbeds, layerK: layerK)
                 .asArray(Float.self)
-            keepImg = Set(imgPos.sorted { scores[$0] > scores[$1] }.prefix(k))
+            if ProcessInfo.processInfo.environment["VISIONZIP_DIVERSITY"] != nil {
+                keepImg = diverseKeep(fullEmbeds: fullEmbeds, imgPos: imgPos, scores: scores, k: k)
+            } else {
+                keepImg = Set(imgPos.sorted { scores[$0] > scores[$1] }.prefix(k))
+            }
         }
 
         var keepIdx = [Int32]()
@@ -869,9 +965,46 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         }
         let pruned = MLX.take(fullEmbeds, MLXArray(keepIdx), axis: 1)
         if ProcessInfo.processInfo.environment["VISIONZIP_LOG"] != nil {
-            print("[visionzip] keep=\(keep) strat=\(strategy) layer=\(layerK): \(n) img -> \(k); seq \(L) -> \(pruned.dim(1))")
+            let div = ProcessInfo.processInfo.environment["VISIONZIP_DIVERSITY"] != nil ? "+div" : ""
+            print("[visionzip] keep=\(keep) strat=\(strategy)\(div) layer=\(layerK): \(n) img -> \(k); seq \(L) -> \(pruned.dim(1))")
         }
         return pruned
+    }
+
+    /// VisPruner-style diversity selection: from the top dominant candidates (by
+    /// attention received), greedily pick `k` via farthest-point on cosine similarity
+    /// of their embeddings, so the kept set spreads across the image instead of
+    /// clustering on one salient region. CPU greedy over ~2k candidates — prefill only.
+    private func diverseKeep(fullEmbeds: MLXArray, imgPos: [Int], scores: [Float], k: Int)
+        -> Set<Int>
+    {
+        let n = imgPos.count
+        let mult = ProcessInfo.processInfo.environment["VISIONZIP_DIVERSITY_MULT"]
+            .flatMap { Double($0) } ?? 2.0
+        let candCount = min(n, max(k + 1, Int(Double(k) * mult)))
+        let cand = Array(imgPos.sorted { scores[$0] > scores[$1] }.prefix(candCount))
+        // normalized candidate embeddings -> cosine similarity matrix
+        let E = MLX.take(fullEmbeds[0], MLXArray(cand.map { Int32($0) }), axis: 0).asType(.float32)
+        let En = E / sqrt((E * E).sum(axis: -1, keepDims: true) + 1e-6)
+        let sim = matmul(En, En.transposed(1, 0)).asArray(Float.self)  // [candCount*candCount]
+        // greedy farthest-point, seeded with the most dominant candidate (cand[0])
+        var selected = Set<Int>([0])
+        var order = [0]
+        var maxSim = (0 ..< candCount).map { sim[$0 * candCount + 0] }
+        while order.count < k {
+            var best = -1
+            var bestVal = Float.greatestFiniteMagnitude
+            for j in 0 ..< candCount where !selected.contains(j) {
+                if maxSim[j] < bestVal { bestVal = maxSim[j]; best = j }
+            }
+            if best < 0 { break }
+            selected.insert(best); order.append(best)
+            for j in 0 ..< candCount {
+                let s = sim[j * candCount + best]
+                if s > maxSim[j] { maxSim[j] = s }
+            }
+        }
+        return Set(order.map { cand[$0] })
     }
 
     private func mergeInputIdsWithImageFeatures(
