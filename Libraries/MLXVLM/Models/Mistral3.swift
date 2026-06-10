@@ -203,7 +203,9 @@ private class Mistral3PatchMerger: Module {
 
         let tokensPerImage = patchSizes.map { $0.0 * $0.1 }
         let d = imageFeatures.dim(-1)
-        var features = imageFeatures.asType(.bfloat16)
+        var features = imageFeatures.asType(
+            ProcessInfo.processInfo.environment["MLX_VLM_DTYPE"] == "float16"
+                ? .float16 : .bfloat16)
 
         // Split the image features into chunks based on tokens per image
         var splitIndices: [Int] = []
@@ -1067,6 +1069,13 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             imageSizes: imageSizes
         )
 
+        if Mistral3PrefixStore.enabled,
+            let cached = prefixCachedPrefill(
+                inputIds: inputIds, embeddings: embeddings, cache: cache)
+        {
+            return cached
+        }
+
         let prof = Self.profileEnabled
         let tLm0 = Date().timeIntervalSince1970 * 1000
         let logits = languageModel(inputIds, cache: cache, inputsEmbeds: embeddings)
@@ -1079,6 +1088,66 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
                     "[breakdown] vision=%.0fms  merge=%.0fms  rank=%.0fms  lm_prefill=%.0fms  | seq=%d→%d",
                 p.vision, p.merge, p.rank, lm, inputIds.dim(1), embeddings.dim(1)))
         }
+        return .logits(.init(logits: logits))
+    }
+
+    /// Prompt-prefix KV cache (PREFIX_CACHE=1). The screen-analysis prompt's
+    /// instruction block is identical across requests; with MISTRAL3_TEXT_FIRST=1
+    /// those tokens precede the image, so their KV is reusable. The static
+    /// boundary is discovered as the longest common token prefix with the
+    /// previous request (capped at the first image token), so the per-request
+    /// dynamic context (app name, window title) never enters the snapshot.
+    /// Request 1: full prefill (learns tokens). Request 2: two-phase prefill,
+    /// snapshot at the boundary. Request 3+: restore snapshot, prefill suffix only.
+    private func prefixCachedPrefill(
+        inputIds: MLXArray, embeddings: MLXArray, cache: [KVCache]
+    ) -> PrepareResult? {
+        // Snapshot/restore relies on KVCacheSimple semantics (state setter
+        // derives offset from the array). Bail out for any other cache type
+        // (e.g. RotatingKVCache when maxKVSize is set).
+        guard cache.allSatisfy({ $0 is KVCacheSimple }) else { return nil }
+        let store = Mistral3PrefixStore.shared
+        let flat: [Int32] = inputIds[0].asArray(Int32.self)
+        let n = flat.count
+        let log = ProcessInfo.processInfo.environment["PREFIX_CACHE_LOG"] == "1"
+
+        // Reuse path: current tokens start with the snapshotted prefix.
+        let k = store.tokens.count
+        if k >= 128, n > k, !store.caches.isEmpty, Array(flat[0 ..< k]) == store.tokens {
+            for i in cache.indices {
+                var c = cache[i]
+                c.state = store.caches[i].state
+            }
+            let logits = languageModel(
+                inputIds[0..., k ..< n], cache: cache,
+                inputsEmbeds: embeddings[0..., k ..< n, 0...])
+            if log { print("[prefixcache] HIT reused=\(k) prefilled=\(n - k)") }
+            store.lastTokens = flat
+            return .logits(.init(logits: logits))
+        }
+
+        // Record path: boundary = LCP with previous request, capped at first
+        // image token (image features are per-request, never cacheable).
+        defer { store.lastTokens = flat }
+        let imgId = Int32(config.imageTokenIndex)
+        let firstImage = flat.firstIndex(of: imgId) ?? n
+        var lcp = 0
+        let prev = store.lastTokens
+        while lcp < prev.count && lcp < n && prev[lcp] == flat[lcp] { lcp += 1 }
+        let boundary = min(lcp, firstImage)
+        guard boundary >= 128 else {
+            if log { print("[prefixcache] MISS no usable boundary (lcp=\(lcp) img=\(firstImage))") }
+            return nil  // fall through to the standard single-shot prefill
+        }
+        _ = languageModel(
+            inputIds[0..., 0 ..< boundary], cache: cache,
+            inputsEmbeds: embeddings[0..., 0 ..< boundary, 0...])
+        store.tokens = Array(flat[0 ..< boundary])
+        store.caches = cache.map { $0.copy() }
+        let logits = languageModel(
+            inputIds[0..., boundary ..< n], cache: cache,
+            inputsEmbeds: embeddings[0..., boundary ..< n, 0...])
+        if log { print("[prefixcache] RECORD snapshot=\(boundary) prefilled=\(n - boundary)") }
         return .logits(.init(logits: logits))
     }
 
@@ -1220,16 +1289,29 @@ public struct Mistral3VLMProcessorConfiguration: Codable, Sendable {
 // MARK: - Message Generator for Mistral3 VLM
 
 /// Message generator for Mistral3 VLM that creates structured messages with image placeholders
+/// Process-global snapshot for the prompt-prefix KV cache (PREFIX_CACHE=1).
+/// Single-slot; the helper serializes requests so no locking is needed.
+final class Mistral3PrefixStore: @unchecked Sendable {
+    nonisolated(unsafe) static let shared = Mistral3PrefixStore()
+    static let enabled = ProcessInfo.processInfo.environment["PREFIX_CACHE"] == "1"
+    var tokens: [Int32] = []
+    var lastTokens: [Int32] = []
+    var caches: [any KVCache] = []
+}
+
 public struct Mistral3MessageGenerator: MessageGenerator {
     public init() {}
 
     public func generate(message: Chat.Message) -> Message {
-        // For Mistral3 VLM, images come before text in the content
-        [
+        // For Mistral3 VLM, images come before text in the content.
+        // MISTRAL3_TEXT_FIRST=1 flips to text-before-image so the constant
+        // instruction tokens form a cacheable prefix (see PREFIX_CACHE).
+        let images: [[String: any Sendable]] = message.images.map { _ in ["type": "image"] }
+        let text: [[String: any Sendable]] = [["type": "text", "text": message.content]]
+        let textFirst = ProcessInfo.processInfo.environment["MISTRAL3_TEXT_FIRST"] == "1"
+        return [
             "role": message.role.rawValue,
-            "content": message.images.map { _ in
-                ["type": "image"]
-            } + [["type": "text", "text": message.content]],
+            "content": textFirst ? text + images : images + text,
         ]
     }
 }

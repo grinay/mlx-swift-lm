@@ -36,6 +36,12 @@ public func loadWeights(
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
+    // MLX_VLM_DTYPE=float16: cast bf16 weights to fp16 at load. M1/M2 GPUs
+    // have no native bf16 — MLX emulates it, costing ~20-30% on prefill.
+    if ProcessInfo.processInfo.environment["MLX_VLM_DTYPE"] == "float16" {
+        weights = weights.mapValues { $0.dtype == .bfloat16 ? $0.asType(.float16) : $0 }
+    }
+
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
         quantize(model: model) { path, module in
