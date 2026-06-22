@@ -1131,12 +1131,10 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         defer { store.lastTokens = flat }
         let imgId = Int32(config.imageTokenIndex)
         let firstImage = flat.firstIndex(of: imgId) ?? n
-        var lcp = 0
-        let prev = store.lastTokens
-        while lcp < prev.count && lcp < n && prev[lcp] == flat[lcp] { lcp += 1 }
-        let boundary = min(lcp, firstImage)
-        guard boundary >= 128 else {
-            if log { print("[prefixcache] MISS no usable boundary (lcp=\(lcp) img=\(firstImage))") }
+        guard let boundary = Self.recordBoundary(
+            flat: flat, lastTokens: store.lastTokens, firstImage: firstImage)
+        else {
+            if log { print("[prefixcache] MISS no usable boundary (img=\(firstImage) n=\(n))") }
             return nil  // fall through to the standard single-shot prefill
         }
         _ = languageModel(
@@ -1149,6 +1147,31 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             inputsEmbeds: embeddings[0..., boundary ..< n, 0...])
         if log { print("[prefixcache] RECORD snapshot=\(boundary) prefilled=\(n - boundary)") }
         return .logits(.init(logits: logits))
+    }
+
+    /// Boundary for the prefix-cache record path: the longest common token
+    /// prefix with the previous request, capped at the first image token
+    /// (image features are per-request, never cacheable). Pure so the guard is
+    /// unit-testable without loading model weights (see Mistral3PrefixCacheTests).
+    ///
+    /// Returns nil — caller falls back to a normal single-shot prefill — when
+    /// the prefix is too short to be worth caching (< `minPrefix`) OR when it
+    /// would consume the whole sequence (`boundary == n`). The latter leaves an
+    /// empty suffix slice `[boundary..<n]`; prefilling a zero-length sequence
+    /// feeds an empty array into attention and crashes MLX's `reshape`
+    /// ("Cannot infer the shape of an empty array"), killing the helper. This
+    /// happens for text-only requests (no image token → `firstImage == n`)
+    /// whose tokens are identical to / a prefix of the previous request's.
+    /// Reported as Sentry RECALL-ADHD-3A.
+    static func recordBoundary(
+        flat: [Int32], lastTokens: [Int32], firstImage: Int, minPrefix: Int = 128
+    ) -> Int? {
+        let n = flat.count
+        var lcp = 0
+        while lcp < lastTokens.count && lcp < n && lastTokens[lcp] == flat[lcp] { lcp += 1 }
+        let boundary = min(lcp, firstImage)
+        guard boundary >= minPrefix, boundary < n else { return nil }
+        return boundary
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
