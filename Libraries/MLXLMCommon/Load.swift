@@ -21,15 +21,42 @@ public func loadWeights(
     var metadata = [String: String]()
     let enumerator = FileManager.default.enumerator(
         at: modelDirectory, includingPropertiesForKeys: nil)!
+    var safetensorURLs = [URL]()
+    var mlxstURLs = [URL]()
     for case let url as URL in enumerator {
-        if url.pathExtension == "safetensors" {
-            let (w, m) = try loadArraysAndMetadata(url: url)
+        switch url.pathExtension {
+        case "safetensors": safetensorURLs.append(url)
+        case "mlxst": mlxstURLs.append(url)
+        default: break
+        }
+    }
+
+    // MLX_MMAP_WEIGHTS=1: prefer page-aligned `.mlxst` repacks, loaded as
+    // file-backed zero-copy views (see MmapWeights.swift). Each successful
+    // mmap load replaces its sibling `.safetensors` shard; on any failure the
+    // shard falls through to the stock loader below.
+    var mmapLoadedSiblings = Set<String>()
+    if ProcessInfo.processInfo.environment["MLX_MMAP_WEIGHTS"] == "1" {
+        for url in mlxstURLs {
+            guard let (w, m) = try mmapLoadArraysAndMetadata(url: url) else { continue }
             for (key, value) in w {
                 weights[key] = value
             }
             if metadata.isEmpty {
                 metadata = m
             }
+            mmapLoadedSiblings.insert(
+                url.deletingPathExtension().appendingPathExtension("safetensors").path)
+        }
+    }
+
+    for url in safetensorURLs where !mmapLoadedSiblings.contains(url.path) {
+        let (w, m) = try loadArraysAndMetadata(url: url)
+        for (key, value) in w {
+            weights[key] = value
+        }
+        if metadata.isEmpty {
+            metadata = m
         }
     }
 
