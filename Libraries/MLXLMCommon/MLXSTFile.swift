@@ -130,12 +130,29 @@ public enum MLXSTFile {
 
     /// Repack a `.safetensors` shard into a page-aligned `.mlxst` file.
     ///
-    /// Lossless: same JSON header schema, same tensor bytes. Tensors are laid
-    /// out in source-offset order, each padded to the next ``pageSize``
-    /// boundary. Writes to `<destination>.tmp` in the same directory and
-    /// atomically renames on success, so an interrupted repack never leaves a
-    /// half-written `.mlxst` behind.
-    public static func repack(safetensors source: URL, to destination: URL) throws {
+    /// Lossless by default: same JSON header schema, same tensor bytes.
+    /// Tensors are laid out in source-offset order, each padded to the next
+    /// ``pageSize`` boundary. Writes to `<destination>.tmp` in the same
+    /// directory and atomically renames on success, so an interrupted repack
+    /// never leaves a half-written `.mlxst` behind.
+    ///
+    /// `convertingBF16To: .float16` additionally converts every BF16 tensor to
+    /// Float16 during the streamed write (round-to-nearest-even via Float32,
+    /// identical to an MLX `asType` cast). This is the supported way to get an
+    /// fp16 model out of a bf16 checkpoint under the mmap loader — casting the
+    /// mmap-backed views at load time is NOT safe (see the donation note on
+    /// `mmapLoadArraysAndMetadata`). The conversion is recorded in the header
+    /// metadata; use ``convertedDtype(url:)`` to detect a stale repack when
+    /// the desired dtype changes.
+    public static func repack(
+        safetensors source: URL, to destination: URL, convertingBF16To targetDType: DType? = nil
+    ) throws {
+        switch targetDType {
+        case .none, .float16: break
+        default:
+            throw MLXSTError.unsupportedDType(
+                key: "convertingBF16To", dtype: String(describing: targetDType!))
+        }
         let sourceHandle = try FileHandle(forReadingFrom: source)
         defer { try? sourceHandle.close() }
 
@@ -154,7 +171,7 @@ public enum MLXSTFile {
 
         // destination layout: source-offset order, each tensor start page-aligned
         var newHeader = [String: Any]()
-        var layout = [(key: String, sourceOffset: Int, nbytes: Int)]()
+        var layout = [(key: String, sourceOffset: Int, nbytes: Int, convert: Bool)]()
         var cursor = 0
         for (key, entry) in entries.sorted(by: { $0.entry.offsets.0 < $1.entry.offsets.0 }) {
             guard entry.offsets.1 - entry.offsets.0 == entry.nbytes else {
@@ -162,12 +179,15 @@ public enum MLXSTFile {
                     "tensor '\(key)': data_offsets span \(entry.offsets.1 - entry.offsets.0), expected \(entry.nbytes)"
                 )
             }
+            // BF16 → F16 keeps element count and item size (2 bytes), so the
+            // destination byte span is unchanged; only the dtype tag differs
+            let convert = targetDType == .float16 && entry.dtype == "BF16"
             newHeader[key] = [
-                "dtype": entry.dtype,
+                "dtype": convert ? "F16" : entry.dtype,
                 "shape": entry.shape,
                 "data_offsets": [cursor, cursor + entry.nbytes],
             ]
-            layout.append((key, entry.offsets.0, entry.nbytes))
+            layout.append((key, entry.offsets.0, entry.nbytes, convert))
             cursor = roundUp(cursor + entry.nbytes, to: pageSize)
         }
 
@@ -177,6 +197,12 @@ public enum MLXSTFile {
         var metadata = sourceMetadata
         metadata["mlxst_version"] = "0"
         metadata["mlxst_page_size"] = String(pageSize)
+        if targetDType == .float16 {
+            // recorded whenever the conversion was REQUESTED (even for a shard
+            // with no BF16 tensors) so a caller can compare against the
+            // currently-desired dtype without re-parsing tensor entries
+            metadata["mlxst_converted"] = "bfloat16->float16"
+        }
         newHeader["__metadata__"] = metadata
 
         let headerBytes = try JSONSerialization.data(
@@ -199,16 +225,16 @@ public enum MLXSTFile {
             }
 
             let chunkSize = 1 << 20
-            for (key, sourceOffset, nbytes) in layout {
+            for (key, sourceOffset, nbytes, convert) in layout {
                 try sourceHandle.seek(toOffset: UInt64(sourcePayloadOffset + sourceOffset))
                 var remaining = nbytes
                 while remaining > 0 {
                     guard let chunk = try sourceHandle.read(upToCount: min(chunkSize, remaining)),
-                        !chunk.isEmpty
+                        !chunk.isEmpty, !(convert && chunk.count % 2 != 0)
                     else {
                         throw MLXSTError.invalidFile("unexpected EOF copying tensor '\(key)'")
                     }
-                    try destinationHandle.write(contentsOf: chunk)
+                    try destinationHandle.write(contentsOf: convert ? convertBF16ToF16(chunk) : chunk)
                     remaining -= chunk.count
                 }
                 let padding = roundUp(nbytes, to: pageSize) - nbytes
@@ -227,6 +253,38 @@ public enum MLXSTFile {
             try? FileManager.default.removeItem(at: temporary)
             throw MLXSTError.invalidFile("rename to \(destination.path) failed: \(error)")
         }
+    }
+
+    /// The dtype conversion recorded in an `.mlxst` file's metadata, or nil
+    /// for a lossless repack. Callers compare this against the dtype they
+    /// currently want (e.g. `.float16` when `MLX_VLM_DTYPE=float16`) and
+    /// re-repack when it differs. Throws if the file is not `.mlxst`.
+    public static func convertedDtype(url: URL) throws -> DType? {
+        guard let header = try readHeader(url: url) else {
+            throw MLXSTError.invalidFile("\(url.lastPathComponent) is not an .mlxst file")
+        }
+        switch header.metadata["mlxst_converted"] {
+        case "bfloat16->float16": return .float16
+        default: return nil
+        }
+    }
+
+    /// bf16 → f16, element-wise: widen to Float32 (bf16 bits are the top half
+    /// of the f32 pattern) then narrow to Float16 with the hardware's
+    /// round-to-nearest-even — the same result an MLX `asType` cast produces.
+    private static func convertBF16ToF16(_ chunk: Data) -> Data {
+        var out = Data(count: chunk.count)
+        out.withUnsafeMutableBytes { destination in
+            chunk.withUnsafeBytes { source in
+                let src = source.bindMemory(to: UInt16.self)
+                let dst = destination.bindMemory(to: UInt16.self)
+                for i in 0 ..< src.count {
+                    let value = Float(bitPattern: UInt32(src[i]) << 16)
+                    dst[i] = Float16(value).bitPattern
+                }
+            }
+        }
+        return out
     }
 
     // MARK: - Shared helpers

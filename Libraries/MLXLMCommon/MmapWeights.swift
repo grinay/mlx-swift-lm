@@ -41,6 +41,25 @@ enum MmapWeightsDiagnostics {
 /// Returns nil when the file is not `.mlxst`, or when the no-copy guard below
 /// detects that the core silently copied instead of mapping — in both cases
 /// the caller falls back to the stock safetensors loader.
+///
+/// WARNING — downstream dtype casts of the returned views are UNSUPPORTED.
+/// Field finding (2026-08): `MLX_MMAP_WEIGHTS=1` + `MLX_VLM_DTYPE=float16`
+/// broke generation (prefill ran, then immediate EOS, empty output). Root
+/// cause, traced through the vendored core: `loadWeights`'s
+/// `mapValues { $0.asType(.float16) }` drops the original view wrapper, so at
+/// eval time the cast's input has `use_count == 1` on both desc and data —
+/// `array::is_donatable()` (array.h:294) is true. `AsType::eval_gpu` →
+/// `copy_gpu(CopyType::Vector)` → `set_copy_output_data`
+/// (backend/common/copy.h:30): same itemsize (bf16 == f16 == 2 B) →
+/// `is_donatable(in, out)` (backend/common/utils.h:185) → `out.copy_shared_buffer(in)`
+/// — the copy kernel then writes f16 bits IN-PLACE into this `PROT_READ`,
+/// `MAP_SHARED` file-backed buffer. GPU writes into a read-only mapping are
+/// dropped/undefined, so every bf16 tensor (norms, scales, embeddings) keeps
+/// its bf16 bit patterns reinterpreted as f16 → garbage weights → instant EOS.
+/// The PORT-PLAN donation analysis only covered inference (module-held weights
+/// have use_count > 1); this load-time cast window was the gap. The supported
+/// path for an fp16 model is repack-time conversion:
+/// `MLXSTFile.repack(safetensors:to:convertingBF16To: .float16)`.
 func mmapLoadArraysAndMetadata(url: URL) throws -> ([String: MLXArray], [String: String])? {
     guard let header = try MLXSTFile.readHeader(url: url) else { return nil }
 

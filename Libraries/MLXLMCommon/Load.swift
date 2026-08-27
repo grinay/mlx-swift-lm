@@ -39,6 +39,22 @@ public func loadWeights(
     if ProcessInfo.processInfo.environment["MLX_MMAP_WEIGHTS"] == "1" {
         for url in mlxstURLs {
             guard let (w, m) = try mmapLoadArraysAndMetadata(url: url) else { continue }
+            // A bf16 tensor served as a read-only mapped view must never meet
+            // the MLX_VLM_DTYPE=float16 cast below: the cast's input becomes
+            // sole-owner at eval, the core donates, and the copy kernel writes
+            // f16 bits into the PROT_READ mapping — garbage weights (see the
+            // donation note on mmapLoadArraysAndMetadata). A repack made with
+            // convertingBF16To: .float16 carries no bf16 tensors; a stale
+            // unconverted one falls back to the stock loader, which casts
+            // freshly-allocated arrays safely.
+            if ProcessInfo.processInfo.environment["MLX_VLM_DTYPE"] == "float16",
+                w.values.contains(where: { $0.dtype == .bfloat16 })
+            {
+                print(
+                    "[mmap] \(url.lastPathComponent): bf16 tensors + MLX_VLM_DTYPE=float16 — "
+                        + "using safetensors loader; repack with convertingBF16To: .float16")
+                continue
+            }
             for (key, value) in w {
                 weights[key] = value
             }

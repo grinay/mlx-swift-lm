@@ -139,6 +139,57 @@ struct MmapWeightsTests {
         }
     }
 
+    @Test func repackConvertingBF16ToF16() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // every finite in-range bf16 value is exactly representable in f16
+        // (8 vs 10 mantissa bits); include out-of-f16-range values to cover
+        // the overflow-to-infinity path of the conversion
+        var bf16Values: [Float] = (0 ..< 510).map { Float($0) * 0.5 - 128 }
+        bf16Values += [70000, -70000]
+        let bf16Bits = bf16Values.map { UInt16($0.bitPattern >> 16) }
+
+        let safetensors = directory.appendingPathComponent("model.safetensors")
+        let mlxst = directory.appendingPathComponent("model.mlxst")
+        try writeSafetensors(
+            to: safetensors,
+            tensors: [
+                ("emb.weight", "BF16", [32, 16], data(bf16Bits)),
+                ("head.weight", "F32", [8], data((0 ..< 8).map { Float($0) })),
+            ],
+            metadata: ["format": "mlx"])
+        try MLXSTFile.repack(safetensors: safetensors, to: mlxst, convertingBF16To: .float16)
+
+        // conversion is recorded and detectable for staleness checks
+        #expect(try MLXSTFile.convertedDtype(url: mlxst) == .float16)
+
+        let loaded = try #require(try mmapLoadArraysAndMetadata(url: mlxst))
+        #expect(MmapWeightsDiagnostics.lastLoad.copied == 0)
+        #expect(loaded.1["mlxst_converted"] == "bfloat16->float16")
+
+        // bf16 tensor arrives as float16 views, bit-equal to the reference
+        // runtime cast (safe here: anonymous arrays, not mapped views)
+        let emb = try #require(loaded.0["emb.weight"])
+        #expect(emb.dtype == .float16)
+        let (reference, _) = try loadArraysAndMetadata(url: safetensors)
+        let referenceCast = try #require(reference["emb.weight"]).asType(.float16)
+        #expect((emb .== referenceCast).all().item(Bool.self))
+
+        // non-bf16 tensors are untouched
+        let head = try #require(loaded.0["head.weight"])
+        let referenceHead = try #require(reference["head.weight"])
+        #expect(head.dtype == .float32)
+        #expect((head .== referenceHead).all().item(Bool.self))
+
+        // a lossless repack reports no conversion
+        let plain = directory.appendingPathComponent("plain.mlxst")
+        try MLXSTFile.repack(safetensors: safetensors, to: plain)
+        #expect(try MLXSTFile.convertedDtype(url: plain) == nil)
+    }
+
     @Test func loadWeightsPrefersMlxstOnlyWhenEnabled() throws {
         // the env toggle is read inside loadWeights; here we verify the
         // sibling-skip bookkeeping indirectly via the loader's building blocks:
