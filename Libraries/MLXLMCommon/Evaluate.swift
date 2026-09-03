@@ -646,7 +646,9 @@ public struct TokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
-        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+        let prepared = try textPrefixCachedPrepare(input: input, windowSize: windowSize)
+            ?? model.prepare(input, cache: cache, windowSize: windowSize)
+        switch prepared {
         case .tokens(let tokens):
             y = tokens
 
@@ -661,6 +663,62 @@ public struct TokenIterator: TokenIteratorProtocol {
 
             break
         }
+    }
+
+    /// Prompt-prefix KV cache for TEXT-ONLY inputs (`PREFIX_CACHE=1`, opt out
+    /// with `PREFIX_CACHE_TEXT=0`). Same contract as the Mistral3 VLM one: the
+    /// static instruction block that starts every request is discovered as
+    /// the longest common token prefix with the previous request; request 1
+    /// learns tokens, request 2 records a KV snapshot at the boundary,
+    /// request 3+ restores it and prefills only the suffix. Field motivation
+    /// (2026-09-03): the labeling reasoner re-prefilled a ~2,000-token
+    /// template on every call — 3.95 s per label on an M1 Max.
+    mutating func textPrefixCachedPrepare(input: LMInput, windowSize: Int?) throws -> PrepareResult? {
+        guard TextPrefixStore.enabled, input.image == nil, input.video == nil,
+              input.text.tokens.ndim == 1,
+              cache.allSatisfy({ $0 is KVCacheSimple })
+        else { return nil }
+        let text = input.text
+        let flat: [Int32] = text.tokens.asType(.int32).asArray(Int32.self)
+        let n = flat.count
+        let store = TextPrefixStore.shared
+        let log = TextPrefixStore.log
+        defer { store.lastTokens = flat }
+
+        // Reuse path.
+        let k = store.tokens.count
+        if k >= 128, n > k, store.caches.count == cache.count,
+           Array(flat[0 ..< k]) == store.tokens {
+            for i in cache.indices {
+                var c = cache[i]
+                c.state = store.caches[i].state
+            }
+            if log { print("[prefixcache:text] HIT reused=\(k) prefilled=\(n - k)") }
+            return try model.prepare(LMInput(text: text[k...]), cache: cache, windowSize: windowSize)
+        }
+
+        // Record path: boundary = LCP with the previous request, leaving at
+        // least one token for the normal path to step on.
+        let prev = store.lastTokens
+        var lcp = 0
+        while lcp < prev.count && lcp < n && prev[lcp] == flat[lcp] { lcp += 1 }
+        let boundary = Swift.min(lcp, n - 1)
+        guard boundary >= 128 else {
+            if log { print("[prefixcache:text] MISS lcp=\(lcp) n=\(n)") }
+            return nil
+        }
+        // Prefill the prefix completely into the cache (prepare leaves a
+        // sub-window remainder; feed it too), then snapshot.
+        if case .tokens(let rest) = try model.prepare(
+            LMInput(text: text[..<boundary]), cache: cache, windowSize: windowSize),
+           rest.tokens.size > 0 {
+            _ = model(rest[.newAxis, 0...], cache: cache, state: nil)
+            eval(cache)
+        }
+        store.tokens = Array(flat[0 ..< boundary])
+        store.caches = cache.map { $0.copy() }
+        if log { print("[prefixcache:text] RECORD snapshot=\(boundary) prefilled=\(n - boundary)") }
+        return try model.prepare(LMInput(text: text[boundary...]), cache: cache, windowSize: windowSize)
     }
 
     mutating func convertToToken(logits: MLXArray) -> MLXArray {
@@ -2047,4 +2105,18 @@ private struct RawTokenLoopHandler: TokenLoopHandler {
     func infoEvent(_ info: GenerateCompletionInfo) -> TokenGeneration {
         .info(info)
     }
+}
+
+/// Process-global single-slot snapshot for ``TokenIterator/textPrefixCachedPrepare``.
+/// Hosts serialize generation, so no locking.
+final class TextPrefixStore: @unchecked Sendable {
+    nonisolated(unsafe) static let shared = TextPrefixStore()
+    static let enabled: Bool = {
+        let env = ProcessInfo.processInfo.environment
+        return env["PREFIX_CACHE"] == "1" && env["PREFIX_CACHE_TEXT"] != "0"
+    }()
+    static let log = ProcessInfo.processInfo.environment["PREFIX_CACHE_LOG"] == "1"
+    var tokens: [Int32] = []
+    var lastTokens: [Int32] = []
+    var caches: [any KVCache] = []
 }

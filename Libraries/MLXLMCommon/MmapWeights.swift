@@ -16,6 +16,7 @@ final class WeightMapHolder {
     init(base: UnsafeMutableRawPointer, length: Int) {
         self.base = base
         self.length = length
+        MmapWeights.register(self)
     }
 
     deinit {
@@ -119,4 +120,44 @@ func mmapLoadArraysAndMetadata(url: URL) throws -> ([String: MLXArray], [String:
         return nil
     }
     return (weights, header.metadata)
+}
+
+/// Process-wide view of live weight mappings, so a host can ask the kernel to
+/// bring a model's pages back before it is needed.
+///
+/// Mapped weights are clean file-backed pages, which macOS evicts first under
+/// pressure. A model that idles for minutes between batches comes back with
+/// almost nothing resident (measured 704 KB of 2.3 GB) and then faults the
+/// whole file in 16 KB pages, in the random order decode touches them, while
+/// generating. `MADV_WILLNEED` turns that into one sequential readahead the
+/// moment a batch is known to be coming; it is a no-op for resident pages.
+public enum MmapWeights {
+    private struct Weak { weak var holder: WeightMapHolder? }
+    nonisolated(unsafe) private static var holders: [Weak] = []
+    private static let lock = NSLock()
+
+    static func register(_ holder: WeightMapHolder) {
+        lock.lock(); defer { lock.unlock() }
+        holders.removeAll { $0.holder == nil }
+        holders.append(Weak(holder: holder))
+    }
+
+    /// Bytes currently mapped across all live weight files.
+    public static var mappedBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return holders.compactMap { $0.holder?.length }.reduce(0, +)
+    }
+
+    /// Ask the kernel to read every live mapping back into memory
+    /// (asynchronous readahead). Returns the number of bytes advised.
+    @discardableResult
+    public static func prefetchAll() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        var advised = 0
+        for w in holders {
+            guard let h = w.holder else { continue }
+            if madvise(h.base, h.length, MADV_WILLNEED) == 0 { advised += h.length }
+        }
+        return advised
+    }
 }
