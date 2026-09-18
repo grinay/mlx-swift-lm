@@ -1284,6 +1284,19 @@ enum Qwen35Language {
     }
 }
 
+/// Process-global snapshot for the prompt-prefix KV cache (PREFIX_CACHE=1).
+/// One model is loaded per helper process and requests are serialized, so a
+/// single slot is all there is to keep.
+final class Qwen35PrefixStore: @unchecked Sendable {
+    nonisolated(unsafe) static let shared = Qwen35PrefixStore()
+    /// Tokens whose KV the snapshot holds.
+    var tokens: [Int32] = []
+    /// The previous request's full token list, for the longest-common-prefix.
+    var lastTokens: [Int32] = []
+    /// Per-layer cache copies taken at the boundary.
+    var caches: [any KVCache] = []
+}
+
 // MARK: - Model
 
 public class Qwen35: Module, VLMModel {
@@ -1421,6 +1434,29 @@ public class Qwen35: Module, VLMModel {
         }
 
         let typedCache = castCache(cache)
+
+        // Prompt-prefix KV cache (PREFIX_CACHE=1). Screen analysis sends the
+        // same ~1.5k-token instruction block in the system turn on every
+        // frame; without this the model re-prefills all of it 4 times a
+        // minute. Mistral3 has had this since 2026-09-03 — the Qwen path
+        // never did, so the move to the distilled 2B silently lost it.
+        // The mask never reaches the transformer — `LanguageModel` forwards
+        // only inputs/embeds/cache/positionIds — it only steers M-RoPE, and
+        // the two-phase prefill hands positions over explicitly, computed
+        // from the same mask production would use.
+        let ropeMask: MLXArray? = {
+            guard let m = input.text.mask, m.ndim == 2, m.dim(-1) == inputIds.dim(-1) else { return nil }
+            return m
+        }()
+        if let embeds = inputEmbeddings,
+           ProcessInfo.processInfo.environment["PREFIX_CACHE"] == "1",
+           let cached = prefixCachedPrefill(
+               inputIds: inputIds, embeddings: embeds, cache: cache,
+               imageFrames: imageFrames, videoFrames: videoFrames, ropeMask: ropeMask)
+        {
+            return cached
+        }
+
         let output = languageModel(
             inputIds,
             inputsEmbeds: inputEmbeddings,
@@ -1433,6 +1469,107 @@ public class Qwen35: Module, VLMModel {
         )
 
         return .logits(output)
+    }
+
+    /// Two-phase prefill that reuses the KV of the static instruction prefix.
+    ///
+    /// The boundary is discovered as the longest common token prefix with the
+    /// previous request, capped at the first image token, so per-request
+    /// context (app name, window title) never enters the snapshot and image
+    /// features — which are per-request — are never cached.
+    ///
+    /// M-RoPE: the full sequence's position ids are computed ONCE here and
+    /// handed to both phases explicitly, so neither phase re-derives positions
+    /// from its own slice (which would restart them at 0 and drift the second
+    /// phase). Returns nil to fall through to the ordinary single-shot
+    /// prefill whenever anything is unusual.
+    private func prefixCachedPrefill(
+        inputIds: MLXArray, embeddings: MLXArray, cache: [any KVCache],
+        imageFrames: [THW]?, videoFrames: [THW]?, ropeMask: MLXArray?
+    ) -> PrepareResult? {
+        // Snapshot/restore is exact for these two; anything else (rotating or
+        // quantized caches) is left to the standard path.
+        guard !cache.isEmpty,
+              cache.allSatisfy({ $0 is KVCacheSimple || $0 is MambaCache })
+        else { return nil }
+        let store = Qwen35PrefixStore.shared
+        let log = ProcessInfo.processInfo.environment["PREFIX_CACHE_LOG"] == "1"
+        let flat: [Int32] = inputIds[0].asArray(Int32.self)
+        let n = flat.count
+        let typedCache = castCache(cache)
+
+        let (positions, _) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: inputIds,
+            imageGridTHW: imageFrames,
+            videoGridTHW: videoFrames,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            visionStartTokenId: config.visionStartTokenId,
+            attentionMask: ropeMask)
+        func run(_ lo: Int, _ hi: Int) -> LMOutput {
+            languageModel(
+                inputIds[0..., lo ..< hi],
+                inputsEmbeds: embeddings[0..., lo ..< hi, 0...],
+                cache: typedCache,
+                mask: nil,
+                positionIds: positions[0..., 0..., lo ..< hi],
+                pixelValues: nil, imageGridTHW: nil, videoGridTHW: nil)
+        }
+
+        // Reuse path: this request starts with the snapshotted prefix.
+        // PREFIX_CACHE_NOREUSE=1 keeps the two-phase prefill but never restores
+        // a snapshot — the A/B that separates "chunking changed the numerics"
+        // from "the snapshot is wrong".
+        let k = ProcessInfo.processInfo.environment["PREFIX_CACHE_NOREUSE"] == "1" ? 0 : store.tokens.count
+        if k >= Self.minPrefixTokens, n > k, store.caches.count == cache.count,
+           Array(flat[0 ..< k]) == store.tokens
+        {
+            for (index, snap) in store.caches.enumerated() {
+                var live = cache[index]
+                live.state = snap.state
+                (live as? BaseKVCache)?.offset = snap.offset
+            }
+            let out = run(k, n)
+            if log { print("[prefixcache] HIT reused=\(k) prefilled=\(n - k)") }
+            store.lastTokens = flat
+            return .logits(out)
+        }
+
+        defer { store.lastTokens = flat }
+        let imgId = Int32(config.imageTokenId)
+        let firstImage = flat.firstIndex(of: imgId) ?? n
+        guard let boundary = Self.recordBoundary(
+            flat: flat, lastTokens: store.lastTokens, firstImage: firstImage)
+        else {
+            if log { print("[prefixcache] MISS no usable boundary (img=\(firstImage) n=\(n))") }
+            return nil
+        }
+        _ = run(0, boundary)
+        store.tokens = Array(flat[0 ..< boundary])
+        store.caches = cache.map { $0.copy() }
+        let out = run(boundary, n)
+        if log { print("[prefixcache] RECORD snapshot=\(boundary) prefilled=\(n - boundary)") }
+        return .logits(out)
+    }
+
+    /// Shortest prefix worth snapshotting. Below this the copy costs more than
+    /// the prefill it saves.
+    static let minPrefixTokens = 128
+
+    /// Boundary for the record path: the longest common token prefix with the
+    /// previous request, capped at the first image token. nil (fall back to a
+    /// single-shot prefill) when the prefix is too short to be worth caching,
+    /// or when it would consume the whole sequence — an empty suffix slice
+    /// crashes MLX's reshape and takes the helper down with it.
+    static func recordBoundary(
+        flat: [Int32], lastTokens: [Int32], firstImage: Int, minPrefix: Int = minPrefixTokens
+    ) -> Int? {
+        var lcp = 0
+        while lcp < lastTokens.count && lcp < flat.count && lastTokens[lcp] == flat[lcp] { lcp += 1 }
+        let boundary = min(lcp, firstImage)
+        guard boundary >= minPrefix, boundary < flat.count else { return nil }
+        return boundary
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
