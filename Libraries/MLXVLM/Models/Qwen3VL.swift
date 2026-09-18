@@ -50,7 +50,14 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
         let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
 
-        let resampled = processed.map { MediaProcessing.resampleBicubic($0, to: targetSize) }
+        // Gamma: CoreImage hands us linear-light values, while the reference
+        // (HF image_processing_qwen3_vl) reads gamma-encoded sRGB. Without this
+        // the model sees a much darker, lower-contrast image than it was
+        // trained on — worst on dark-theme UI, which is most of a screen
+        // recorder's input. Every other VLM processor here (Qwen2/2.5-VL,
+        // Pixtral, Mistral3) already applies it; Qwen3-VL was the outlier.
+        let toned = processed.map { MediaProcessing.inSRGBToneCurveSpace($0) }
+        let resampled = toned.map { MediaProcessing.resampleBicubic($0, to: targetSize) }
 
         let normalized =
             resampled
