@@ -389,18 +389,22 @@ enum Qwen3VLVision {
         return concatenated([-second, first], axis: -1)
     }
 
-    static func applyRotary(_ tensor: MLXArray, freqs: MLXArray) -> MLXArray {
-        var cosVals = cos(freqs)
-        var sinVals = sin(freqs)
+    /// cos/sin for the tower's rotary embedding, shaped for the attention
+    /// tensors. The frequencies are the same for every block and both
+    /// projections, so this runs ONCE per frame in `VisionModel` instead of the
+    /// 48 times (24 blocks × queries and keys) the per-call version cost.
+    static func rotaryCosSin(freqs: MLXArray) -> (cos: MLXArray, sin: MLXArray) {
+        func shaped(_ v: MLXArray) -> MLXArray {
+            var out = expandedDimensions(v, axis: 1)
+            out = tiled(out, repetitions: [1, 1, 2])
+            return expandedDimensions(out, axis: 0)
+        }
+        return (shaped(cos(freqs)), shaped(sin(freqs)))
+    }
 
-        cosVals = expandedDimensions(cosVals, axis: 1)
-        cosVals = tiled(cosVals, repetitions: [1, 1, 2])
-        cosVals = expandedDimensions(cosVals, axis: 0)
-
-        sinVals = expandedDimensions(sinVals, axis: 1)
-        sinVals = tiled(sinVals, repetitions: [1, 1, 2])
-        sinVals = expandedDimensions(sinVals, axis: 0)
-
+    static func applyRotary(_ tensor: MLXArray, cos cosVals: MLXArray, sin sinVals: MLXArray)
+        -> MLXArray
+    {
         let rotated = (tensor * cosVals) + (rotateHalf(tensor) * sinVals)
         return rotated.asType(tensor.dtype)
     }
@@ -525,8 +529,9 @@ enum Qwen3VLVision {
 
         func callAsFunction(
             _ x: MLXArray,
-            cuSeqlens: MLXArray,
-            rotaryPosEmb: MLXArray
+            cuSeqlens: [Int],
+            rotaryCos: MLXArray,
+            rotarySin: MLXArray
         ) -> MLXArray {
             let sequenceLength = x.dim(0)
 
@@ -539,8 +544,8 @@ enum Qwen3VLVision {
             var keys = parts[1][0, 0..., 0..., 0...]
             var values = parts[2][0, 0..., 0..., 0...]
 
-            queries = applyRotary(queries, freqs: rotaryPosEmb)
-            keys = applyRotary(keys, freqs: rotaryPosEmb)
+            queries = applyRotary(queries, cos: rotaryCos, sin: rotarySin)
+            keys = applyRotary(keys, cos: rotaryCos, sin: rotarySin)
 
             queries = queries.reshaped(1, sequenceLength, numHeads, headDim).transposed(0, 2, 1, 3)
             keys = keys.reshaped(1, sequenceLength, numHeads, headDim).transposed(0, 2, 1, 3)
@@ -561,7 +566,10 @@ enum Qwen3VLVision {
             // to be clamped to 1280 in QwenOsx / Recall. Without an explicit
             // mask each chunked call can dispatch to the flash-attention path
             // and stays under the cap regardless of total sequence length.
-            let seqlens = cuSeqlens.asArray(Int.self)
+            // `cuSeqlens` arrives as a plain [Int]: reading it off the GPU is a
+            // blocking sync, and it is identical for all 24 blocks, so the read
+            // happens once per frame in `VisionModel`, not once per block.
+            let seqlens = cuSeqlens
             var chunks: [MLXArray] = []
             chunks.reserveCapacity(seqlens.count - 1)
             for idx in 1 ..< seqlens.count {
@@ -618,12 +626,14 @@ enum Qwen3VLVision {
 
         func callAsFunction(
             _ hiddenStates: MLXArray,
-            cuSeqlens: MLXArray,
-            rotaryPosEmb: MLXArray
+            cuSeqlens: [Int],
+            rotaryCos: MLXArray,
+            rotarySin: MLXArray
         ) -> MLXArray {
             var states = hiddenStates
             states =
-                states + attention(norm1(states), cuSeqlens: cuSeqlens, rotaryPosEmb: rotaryPosEmb)
+                states + attention(norm1(states), cuSeqlens: cuSeqlens,
+                                   rotaryCos: rotaryCos, rotarySin: rotarySin)
             states = states + mlp(norm2(states))
             return states
         }
@@ -886,12 +896,14 @@ enum Qwen3VLVision {
             hiddenStates = hiddenStates + posEmbeds
 
             let rotaryEmbeds = rotaryPositionEmbedding(gridTHW)
-            let cuSeqlens = cumulativeSequenceLengths(gridTHW)
+            let (rotaryCos, rotarySin) = rotaryCosSin(freqs: rotaryEmbeds)
+            let cuSeqlens = cumulativeSequenceLengths(gridTHW).asArray(Int.self)
 
             var deepstackOutputs: [MLXArray] = []
 
             for (index, block) in blocks.enumerated() {
-                hiddenStates = block(hiddenStates, cuSeqlens: cuSeqlens, rotaryPosEmb: rotaryEmbeds)
+                hiddenStates = block(hiddenStates, cuSeqlens: cuSeqlens,
+                                     rotaryCos: rotaryCos, rotarySin: rotarySin)
                 if let dsIndex = deepstackVisualIndexes.firstIndex(of: index) {
                     let feature = deepstackMergers[dsIndex](hiddenStates)
                     deepstackOutputs.append(feature)
