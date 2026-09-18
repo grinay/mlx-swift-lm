@@ -1413,12 +1413,21 @@ public class Qwen35: Module, VLMModel {
 
         var inputEmbeddings: MLXArray?
 
+        // QWEN_PROFILE=1 splits the frame cost into vision encode / merge /
+        // LM prefill with eval() barriers, so an optimization is aimed at the
+        // phase that actually costs (the barriers themselves cost a little).
+        let prof = ProcessInfo.processInfo.environment["QWEN_PROFILE"] == "1"
+        func ms() -> Double { Date().timeIntervalSince1970 * 1000 }
+        let t0 = ms()
+        var tVision = t0, tMerge = t0
+
         if let pixelValues,
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
                 .nilIfEmpty
         {
             let textEmbeds = languageModel.model.embedTokens(inputIds)
             let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
+            if prof { eval(visionHidden); tVision = ms() }
             let visionFeatures = visionHidden.asType(textEmbeds.dtype)
 
             let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
@@ -1429,6 +1438,7 @@ public class Qwen35: Module, VLMModel {
                 videoTokenIndex: config.videoTokenIndex
             )
             inputEmbeddings = mergedEmbeds
+            if prof { eval(mergedEmbeds); tMerge = ms() }
         } else {
             languageModel.resetPositionState()
         }
@@ -1454,6 +1464,11 @@ public class Qwen35: Module, VLMModel {
                inputIds: inputIds, embeddings: embeds, cache: cache,
                imageFrames: imageFrames, videoFrames: videoFrames, ropeMask: ropeMask)
         {
+            if prof, case .logits(let out) = cached {
+                eval(out.logits)
+                print(String(format: "[qwenprofile] vision=%.0fms merge=%.0fms prefill=%.0fms seq=%d",
+                             tVision - t0, tMerge - tVision, ms() - tMerge, inputIds.dim(1)))
+            }
             return cached
         }
 
